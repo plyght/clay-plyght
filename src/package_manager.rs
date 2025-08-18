@@ -1862,18 +1862,18 @@ impl PackageManager {
                                 )
                                 .await
                             {
-                                eprintln!(
+                                println!(
                                     "{} Failed to create bin command {}: {}",
                                     style("⚠").yellow(),
                                     style(command_name).white(),
                                     e
                                 );
                             } else {
-                                // println!(
-                                //     "{} Added bin command: {}",
-                                //     style("🔧").blue(),
-                                //     style(command_name).white()
-                                // );
+                                println!(
+                                    "{} Added bin command: {}",
+                                    style("🔧").blue(),
+                                    style(command_name).white()
+                                );
                             }
                         }
                     }
@@ -2051,6 +2051,39 @@ impl PackageManager {
             style(&format!("({})", script_command)).dim()
         );
 
+        // Check if node_modules/.bin exists and list contents for debugging
+        let bin_dir = self.node_modules_dir.join(".bin");
+        if !bin_dir.exists() {
+            println!(
+                "{} Warning: .bin directory not found at {}",
+                style("⚠").yellow(),
+                bin_dir.display()
+            );
+            println!(
+                "{} Installing packages may be required to create bin commands",
+                style("💡").blue()
+            );
+        } else {
+            // List available bin commands for debugging
+            if let Ok(mut entries) = fs::read_dir(&bin_dir).await {
+                let mut bin_commands = Vec::new();
+                while let Some(entry) = entries.next_entry().await.unwrap_or(None) {
+                    if let Ok(name) = entry.file_name().into_string() {
+                        if !name.ends_with(".cmd") {
+                            bin_commands.push(name);
+                        }
+                    }
+                }
+                if !bin_commands.is_empty() {
+                    println!(
+                        "{} Available bin commands: {}",
+                        style("🔧").dim(),
+                        bin_commands.join(", ")
+                    );
+                }
+            }
+        }
+
         // Set up environment with .bin in PATH
         let mut cmd = if cfg!(target_os = "windows") {
             let mut cmd = Command::new("cmd");
@@ -2064,7 +2097,6 @@ impl PackageManager {
         };
 
         // Add node_modules/.bin to PATH
-        let bin_dir = self.node_modules_dir.join(".bin");
         if bin_dir.exists() {
             let current_path = std::env::var("PATH").unwrap_or_default();
             let path_separator = if cfg!(target_os = "windows") {
@@ -2083,12 +2115,18 @@ impl PackageManager {
                 )
             };
             cmd.env("PATH", new_path);
+            println!(
+                "{} Added {} to PATH",
+                style("🔧").dim(),
+                bin_dir.to_string_lossy()
+            );
         }
 
         // Set working directory to project root
         cmd.current_dir(self.package_json_path.parent().unwrap_or(Path::new(".")));
 
         // Execute the command
+        println!("{} Executing command...", style("⚡").cyan());
         let status = cmd.status()?;
 
         if status.success() {
