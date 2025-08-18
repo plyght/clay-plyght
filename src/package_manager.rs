@@ -1869,11 +1869,11 @@ impl PackageManager {
                                     e
                                 );
                             } else {
-                                println!(
-                                    "{} Added bin command: {}",
-                                    style("🔧").blue(),
-                                    style(command_name).white()
-                                );
+                                // println!(
+                                //     "{} Added bin command: {}",
+                                //     style("🔧").blue(),
+                                //     style(command_name).white()
+                                // );
                             }
                         }
                     }
