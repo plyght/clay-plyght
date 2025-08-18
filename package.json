@@ -1,0 +1,10 @@
+{
+  "name": "my-project",
+  "version": "1.0.0",
+  "description": null,
+  "main": "index.js",
+  "dependencies": {
+    "express": "5.1.0"
+  },
+  "devDependencies": {}
+}

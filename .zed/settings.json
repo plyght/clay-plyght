@@ -1,0 +1,19 @@
+{
+  "file_scan_exclusions": [
+    "**/*.git",
+    "**/.gitignore",
+    "**/bun.lock",
+    // "**/*node_modules",
+    "**/*.next",
+    "**/*.dockerignore",
+    "**/*next-env.d.ts",
+    "generated",
+    "**/.astro",
+    ".vscode",
+    "*pnpm*",
+    "**postcss**",
+    "**eslint**",
+    "target",
+    ".tanstack"
+  ]
+}
