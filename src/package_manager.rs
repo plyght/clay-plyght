@@ -71,13 +71,6 @@ impl PackageResolver {
 
             // Check for circular dependency
             if self.resolution_stack.contains(&package_key) {
-                print!(
-                    "\r  {} Circular dependency detected for {}{}",
-                    style("⚠").yellow(),
-                    style(&name).white(),
-                    " ".repeat(30)
-                );
-                println!();
                 continue;
             }
 
@@ -88,16 +81,12 @@ impl PackageResolver {
 
             self.resolution_stack.insert(package_key.clone());
 
+            // Show intermediate resolution status
             print!(
-                "\r{} Resolving {}{}...{}",
-                style("🔍").cyan(),
+                "\r    {} Fetching info for {}...{}",
+                style("↓").blue(),
                 style(&name).white(),
-                if version_spec != "latest" {
-                    format!("@{}", style(&version_spec).dim())
-                } else {
-                    String::new()
-                },
-                " ".repeat(30)
+                " ".repeat(50)
             );
             io::stdout().flush().unwrap();
 
@@ -107,6 +96,14 @@ impl PackageResolver {
                 self.resolved_cache.insert(name.clone(), response);
             }
             let registry_response = self.resolved_cache.get(&name).unwrap();
+
+            print!(
+                "\r    {} Selecting version for {}...{}",
+                style("🔍").yellow(),
+                style(&name).white(),
+                " ".repeat(50)
+            );
+            io::stdout().flush().unwrap();
 
             // Resolve version
             let package_info = if version_spec == "latest" {
@@ -127,9 +124,20 @@ impl PackageResolver {
 
             let package_info = package_info.clone();
 
-            print!("\r{}", " ".repeat(80));
-            print!("\r");
-            io::stdout().flush().unwrap();
+            // Show dependency resolution status if package has dependencies
+            if package_info.dependencies.is_some()
+                && !package_info.dependencies.as_ref().unwrap().is_empty()
+            {
+                let dep_count = package_info.dependencies.as_ref().unwrap().len();
+                print!(
+                    "\r    {} Processing {} dependencies for {}...{}",
+                    style("⚡").magenta(),
+                    style(dep_count.to_string()).yellow(),
+                    style(&name).white(),
+                    " ".repeat(30)
+                );
+                io::stdout().flush().unwrap();
+            }
 
             // Add dependencies to work stack
             let mut dep_keys = Vec::new();
@@ -162,8 +170,22 @@ impl PackageResolver {
         }
 
         // Build dependency tree
+        print!(
+            "\r    {} Building dependency tree for {}...{}",
+            style("🌳").green(),
+            style(root_name).white(),
+            " ".repeat(50)
+        );
+        io::stdout().flush().unwrap();
+
         let root_key = format!("{}@{}", root_name, root_version_spec);
-        self.build_dependency_tree(&root_key, &resolved_packages, &dependency_graph)
+        let result = self.build_dependency_tree(&root_key, &resolved_packages, &dependency_graph);
+
+        // Clear the building tree message completely
+        print!("\r{}\r", " ".repeat(100));
+        io::stdout().flush().unwrap();
+
+        result
     }
 
     fn build_dependency_tree(
@@ -265,23 +287,24 @@ impl PackageResolver {
 
         for (name, version, is_dev) in packages {
             print!(
-                "\r{} Resolving {}{}...{}",
-                style("🔍").blue(),
-                style(&name).white().bold(),
-                if version != "latest" {
-                    format!("@{}", style(&version).dim())
-                } else {
-                    String::new()
-                },
-                " ".repeat(30)
+                "\r  {} Resolving {}...{}",
+                style("→").cyan(),
+                style(&name).white(),
+                " ".repeat(50)
             );
             use std::io::{self, Write};
             io::stdout().flush().unwrap();
 
             match self.resolve_package(&name, &version, is_dev).await {
                 Ok(resolved_pkg) => {
-                    print!("\r{}", " ".repeat(80));
-                    print!("\r");
+                    print!(
+                        "\r  {} Resolved {} ({}){}",
+                        style("✓").green(),
+                        style(&name).white(),
+                        style(&resolved_pkg.version).dim(),
+                        " ".repeat(50)
+                    );
+                    print!("\n");
                     io::stdout().flush().unwrap();
                     resolved.push(resolved_pkg);
                 }
@@ -293,6 +316,7 @@ impl PackageResolver {
                         style(&name).white().bold(),
                         style(e.to_string()).dim()
                     );
+                    io::stdout().flush().unwrap();
                     continue;
                 }
             }
@@ -401,18 +425,76 @@ pub struct PackageManager {
     lock_file_path: PathBuf,
     semaphore: Arc<Semaphore>,
     file_mutex: Arc<Mutex<()>>,
+    cache_dir: PathBuf,
 }
 
 impl PackageManager {
     pub fn new() -> Self {
+        let cache_dir = Self::get_cache_dir();
         Self {
             npm_client: NpmClient::new(),
             node_modules_dir: PathBuf::from("node_modules"),
             package_json_path: PathBuf::from("package.json"),
             lock_file_path: PathBuf::from("fnpm-lock.json"),
-            semaphore: Arc::new(Semaphore::new(8)), // Allow 8 concurrent downloads
+            semaphore: Arc::new(Semaphore::new(8)), // Limit concurrent downloads
             file_mutex: Arc::new(Mutex::new(())),
+            cache_dir,
         }
+    }
+
+    fn get_cache_dir() -> PathBuf {
+        if let Some(home) = dirs::home_dir() {
+            home.join(".fnpm").join("cache")
+        } else {
+            PathBuf::from(".fnpm-cache")
+        }
+    }
+
+    async fn ensure_cache_dir_exists(&self) -> Result<()> {
+        if !self.cache_dir.exists() {
+            fs::create_dir_all(&self.cache_dir).await?;
+        }
+        Ok(())
+    }
+
+    fn get_cache_path(&self, package_info: &PackageInfo) -> PathBuf {
+        self.cache_dir.join(format!(
+            "{}@{}.tgz",
+            package_info.name, package_info.version
+        ))
+    }
+
+    async fn is_cached(&self, package_info: &PackageInfo) -> bool {
+        let cache_path = self.get_cache_path(package_info);
+        cache_path.exists()
+    }
+
+    async fn copy_from_cache(&self, package_info: &PackageInfo, dest_path: &Path) -> Result<()> {
+        let cache_path = self.get_cache_path(package_info);
+        if cache_path.exists() {
+            fs::copy(&cache_path, dest_path).await?;
+
+            // Verify cached file integrity
+            let bytes = fs::read(dest_path).await?;
+            if !self
+                .npm_client
+                .verify_package_integrity(&bytes, &package_info.dist.shasum)?
+            {
+                // Cache is corrupted, remove it
+                fs::remove_file(&cache_path).await.ok();
+                return Err(anyhow!("Cached file is corrupted"));
+            }
+
+            return Ok(());
+        }
+        Err(anyhow!("File not in cache"))
+    }
+
+    async fn save_to_cache(&self, package_info: &PackageInfo, source_path: &Path) -> Result<()> {
+        self.ensure_cache_dir_exists().await?;
+        let cache_path = self.get_cache_path(package_info);
+        fs::copy(source_path, &cache_path).await?;
+        Ok(())
     }
 
     /// Install multiple packages with unified progress
@@ -427,6 +509,8 @@ impl PackageManager {
             .map(|(name, version)| (name, version, is_dev))
             .collect();
 
+        // Phase 1: Resolution
+        println!("{} Resolving dependencies...", style("🔍").blue());
         let resolved_packages = resolver.resolve_multiple_packages(package_specs).await?;
 
         if resolved_packages.is_empty() {
@@ -1099,7 +1183,7 @@ impl PackageManager {
         Ok(())
     }
 
-    /// Download package tarball to a temporary location
+    /// Download package tarball to a temporary location (with caching)
     async fn download_package_tarball(
         &self,
         package_info: &crate::package_info::PackageInfo,
@@ -1113,9 +1197,26 @@ impl PackageManager {
         // Ensure temp directory exists
         fs::create_dir_all(&temp_dir).await?;
 
+        // Try to copy from cache first
+        if self.is_cached(package_info).await {
+            match self.copy_from_cache(package_info, &tarball_path).await {
+                Ok(()) => {
+                    return Ok(tarball_path);
+                }
+                Err(_) => {
+                    // Cache miss or corrupted, continue with download
+                }
+            }
+        }
+
+        // Download from registry
         self.npm_client
             .download_package(package_info, &tarball_path)
             .await?;
+
+        // Save to cache for future use
+        self.save_to_cache(package_info, &tarball_path).await.ok();
+
         Ok(tarball_path)
     }
 
@@ -1378,6 +1479,145 @@ impl PackageManager {
                 package_name
             ))
         }
+    }
+
+    /// Show cache information
+    pub async fn cache_info(&self) -> Result<()> {
+        use console::style;
+
+        self.ensure_cache_dir_exists().await?;
+
+        let mut total_size = 0u64;
+        let mut package_count = 0u32;
+
+        if self.cache_dir.exists() {
+            let mut entries = fs::read_dir(&self.cache_dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                if let Ok(metadata) = entry.metadata().await {
+                    if metadata.is_file()
+                        && entry.path().extension().map_or(false, |ext| ext == "tgz")
+                    {
+                        total_size += metadata.len();
+                        package_count += 1;
+                    }
+                }
+            }
+        }
+
+        println!("{} Cache Information", style("📦").cyan());
+        println!("Cache directory: {}", style(self.cache_dir.display()).dim());
+        println!(
+            "Cached packages: {}",
+            style(package_count.to_string()).green()
+        );
+        println!(
+            "Total size: {}",
+            style(Self::format_size(total_size)).green()
+        );
+
+        Ok(())
+    }
+
+    /// Clear all cached packages
+    pub async fn cache_clear(&self) -> Result<()> {
+        use console::style;
+
+        if self.cache_dir.exists() {
+            let mut entries = fs::read_dir(&self.cache_dir).await?;
+            let mut cleared_count = 0u32;
+
+            while let Some(entry) = entries.next_entry().await? {
+                if entry.path().extension().map_or(false, |ext| ext == "tgz") {
+                    fs::remove_file(entry.path()).await?;
+                    cleared_count += 1;
+                }
+            }
+
+            println!(
+                "{} Cleared {} cached packages",
+                style("✓").green(),
+                style(cleared_count.to_string()).green()
+            );
+        } else {
+            println!("{} Cache directory does not exist", style("•").yellow());
+        }
+
+        Ok(())
+    }
+
+    /// Show cache directory path
+    pub async fn cache_dir(&self) -> Result<()> {
+        use console::style;
+
+        println!("{}", self.cache_dir.display());
+
+        if !self.cache_dir.exists() {
+            println!("{} Cache directory does not exist yet", style("•").dim());
+        }
+
+        Ok(())
+    }
+
+    fn format_size(bytes: u64) -> String {
+        const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+        let mut size = bytes as f64;
+        let mut unit_index = 0;
+
+        while size >= 1024.0 && unit_index < UNITS.len() - 1 {
+            size /= 1024.0;
+            unit_index += 1;
+        }
+
+        if unit_index == 0 {
+            format!("{} {}", size as u64, UNITS[unit_index])
+        } else {
+            format!("{:.1} {}", size, UNITS[unit_index])
+        }
+    }
+
+    /// Read dependencies from package.json and convert to package specs
+    pub async fn get_package_json_dependencies(
+        &self,
+        include_dev: bool,
+    ) -> Result<Vec<(String, String)>> {
+        if !self.package_json_path.exists() {
+            println!("{} No package.json found", style("•").yellow());
+            return Ok(Vec::new());
+        }
+
+        let content = fs::read_to_string(&self.package_json_path).await?;
+        let package_json: PackageJson = if content.trim().is_empty() {
+            PackageJson::new()
+        } else {
+            serde_json::from_str(&content).unwrap_or_else(|_| PackageJson::new())
+        };
+
+        let mut package_specs = Vec::new();
+
+        // Add regular dependencies
+        if let Some(dependencies) = &package_json.dependencies {
+            for (name, version_spec) in dependencies {
+                package_specs.push((name.clone(), version_spec.clone()));
+            }
+        }
+
+        // Add dev dependencies if requested
+        if include_dev {
+            if let Some(dev_dependencies) = &package_json.dev_dependencies {
+                for (name, version_spec) in dev_dependencies {
+                    package_specs.push((name.clone(), version_spec.clone()));
+                }
+            }
+        }
+
+        if package_specs.is_empty() {
+            println!(
+                "{} No dependencies found in package.json",
+                style("•").yellow()
+            );
+        }
+
+        Ok(package_specs)
     }
 }
 

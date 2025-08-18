@@ -38,6 +38,19 @@ enum Commands {
     },
     /// Show installed packages
     List,
+    /// Manage package cache
+    #[command(subcommand)]
+    Cache(CacheCommands),
+}
+
+#[derive(Subcommand)]
+enum CacheCommands {
+    /// Show cache information
+    Info,
+    /// Clear all cached packages
+    Clear,
+    /// Show cache directory path
+    Dir,
 }
 
 #[tokio::main]
@@ -47,12 +60,12 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Install { packages, dev } => {
-            if packages.is_empty() {
-                // Install dependencies from package.json
-                package_manager.install_dependencies().await?;
+            let package_specs = if packages.is_empty() {
+                // Read dependencies from package.json
+                package_manager.get_package_json_dependencies(dev).await?
             } else {
                 // Parse package specifications
-                let mut package_specs = Vec::new();
+                let mut specs = Vec::new();
                 for package_spec in packages {
                     let (package_name, version) = if let Some(at_pos) = package_spec.rfind('@') {
                         if at_pos > 0 {
@@ -68,14 +81,15 @@ async fn main() -> Result<()> {
                         // No @ symbol, use latest version
                         (package_spec, "latest".to_string())
                     };
-                    package_specs.push((package_name, version));
+                    specs.push((package_name, version));
                 }
+                specs
+            };
 
-                // Install all packages with unified interface
-                package_manager
-                    .install_multiple_packages(package_specs, dev)
-                    .await?;
-            }
+            // Always use unified interface with resolver
+            package_manager
+                .install_multiple_packages(package_specs, dev)
+                .await?;
         }
         Commands::Uninstall { packages } => {
             for package_name in packages {
@@ -85,6 +99,17 @@ async fn main() -> Result<()> {
         Commands::List => {
             package_manager.list_installed_packages().await?;
         }
+        Commands::Cache(cache_cmd) => match cache_cmd {
+            CacheCommands::Info => {
+                package_manager.cache_info().await?;
+            }
+            CacheCommands::Clear => {
+                package_manager.cache_clear().await?;
+            }
+            CacheCommands::Dir => {
+                package_manager.cache_dir().await?;
+            }
+        },
     }
 
     Ok(())
