@@ -147,7 +147,8 @@ async fn upgrade_clay(skip_confirmation: bool) -> Result<()> {
 
     println!("{}", style("Downloading installer...").cyan());
 
-    let install_script_url = "https://raw.githubusercontent.com/lassejlv/clay/main/install.sh";
+    let install_script_url =
+        "https://raw.githubusercontent.com/lassejlv/clay/main/scripts/install.sh";
     let response = reqwest::get(install_script_url).await?;
 
     if !response.status().is_success() {
