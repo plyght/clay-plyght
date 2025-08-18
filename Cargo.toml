@@ -1,10 +1,10 @@
 [package]
-name = "fnpm"
+name = "clay"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "fnpm"
+name = "clay"
 
 
 [dependencies]

@@ -1,3 +1,15 @@
-# FNPM - A Simple Node.js Package Manager
+# Clay
 
-`Fast NPM` is a fast and simple package manager for Node.js, designed to be a drop-in replacement for npm. It aims to provide a more efficient and user-friendly experience for managing Node.js packages.
+Pretty fast package manager for node.js written in Rust
+
+## Features
+- Fast
+- Cache
+- Install from cache
+- Install from npm registry
+- Faster than npm (sometimes pnpm)
+
+
+### WARNING!!
+
+This is a work in progress, it is not ready for production use yet.

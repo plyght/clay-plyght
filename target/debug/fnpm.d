@@ -1,1 +1,0 @@
-/Users/lassevestergaard/Documents/Dev/fnpm/target/debug/fnpm: /Users/lassevestergaard/Documents/Dev/fnpm/src/main.rs /Users/lassevestergaard/Documents/Dev/fnpm/src/npm_client.rs /Users/lassevestergaard/Documents/Dev/fnpm/src/package_info.rs /Users/lassevestergaard/Documents/Dev/fnpm/src/package_manager.rs
