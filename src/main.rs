@@ -41,6 +41,10 @@ enum Commands {
         yes: bool,
     },
 
+    Run {
+        script: Option<String>,
+    },
+
     #[command(subcommand)]
     Cache(CacheCommands),
 }
@@ -70,25 +74,26 @@ async fn main() -> Result<()> {
                 package_manager.get_package_json_dependencies(dev).await?
             } else {
                 let mut specs = Vec::new();
-                for package_spec in packages {
+                for package_spec in &packages {
                     let (package_name, version) = if let Some(at_pos) = package_spec.rfind('@') {
                         if at_pos > 0 {
                             let name = &package_spec[..at_pos];
                             let version = &package_spec[at_pos + 1..];
                             (name.to_string(), version.to_string())
                         } else {
-                            (package_spec, "latest".to_string())
+                            (package_spec.clone(), "latest".to_string())
                         }
                     } else {
-                        (package_spec, "latest".to_string())
+                        (package_spec.clone(), "latest".to_string())
                     };
                     specs.push((package_name, version));
                 }
                 specs
             };
 
+            let is_specific_install = !packages.is_empty();
             package_manager
-                .install_multiple_packages(package_specs, dev)
+                .install_multiple_packages(package_specs, dev, is_specific_install)
                 .await?;
         }
         Commands::Uninstall { packages } => {
@@ -103,6 +108,17 @@ async fn main() -> Result<()> {
         }
         Commands::Upgrade { yes } => {
             upgrade_clay(yes).await?;
+        }
+        Commands::Run { script } => {
+            let package_manager = PackageManager::new();
+            match script {
+                Some(script_name) => {
+                    package_manager.run_script(&script_name).await?;
+                }
+                None => {
+                    package_manager.list_scripts().await?;
+                }
+            }
         }
         Commands::Cache(cache_cmd) => {
             let package_manager = PackageManager::new();

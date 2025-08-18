@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -7,6 +8,7 @@ pub struct PackageInfo {
     pub version: String,
     pub description: Option<String>,
     pub main: Option<String>,
+    pub bin: Option<Value>,
     pub dependencies: Option<HashMap<String, String>>,
     pub dist: DistInfo,
 }
@@ -47,6 +49,7 @@ pub struct PackageJson {
     pub version: Option<String>,
     pub description: Option<String>,
     pub main: Option<String>,
+    pub bin: Option<Value>,
     pub dependencies: Option<HashMap<String, String>>,
     #[serde(rename = "devDependencies")]
     pub dev_dependencies: Option<HashMap<String, String>>,
@@ -59,6 +62,7 @@ impl PackageJson {
             version: Some("1.0.0".to_string()),
             description: None,
             main: Some("index.js".to_string()),
+            bin: None,
             dependencies: Some(HashMap::new()),
             dev_dependencies: Some(HashMap::new()),
         }

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::fs;
 
+use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::npm_client::NpmClient;
@@ -220,6 +221,7 @@ impl PackageResolver {
                     version: "0.0.0".to_string(),
                     description: None,
                     main: None,
+                    bin: None,
                     dist: DistInfo {
                         tarball: String::new(),
                         shasum: String::new(),
@@ -430,6 +432,7 @@ pub struct PackageManager {
 }
 
 impl PackageManager {
+    /// Create a new PackageManager with default settings
     pub fn new() -> Self {
         Self::with_toml_lock(true)
     }
@@ -514,9 +517,36 @@ impl PackageManager {
         &self,
         packages: Vec<(String, String)>,
         is_dev: bool,
+        is_specific_install: bool,
     ) -> Result<()> {
+        // Early check: see if all packages are already installed
+        let (already_installed, packages_to_check) =
+            self.check_packages_already_installed(&packages).await?;
+
+        // Show already installed packages only for specific installs
+        if is_specific_install {
+            for package in &already_installed {
+                println!(
+                    "{} {} already installed",
+                    style("•").cyan(),
+                    style(package).white()
+                );
+            }
+        }
+
+        // If all packages are already installed, skip resolution entirely
+        if packages_to_check.is_empty() {
+            if is_specific_install {
+                println!("{} All packages are already installed", style("✓").green());
+            } else {
+                println!("{} All packages are already installed", style("✓").green());
+                self.show_installed_packages_summary().await?;
+            }
+            return Ok(());
+        }
+
         let mut resolver = PackageResolver::new(self.npm_client.clone());
-        let package_specs: Vec<(String, String, bool)> = packages
+        let package_specs: Vec<(String, String, bool)> = packages_to_check
             .into_iter()
             .map(|(name, version)| (name, version, is_dev))
             .collect();
@@ -530,29 +560,45 @@ impl PackageManager {
             return Ok(());
         }
 
-        // Check which packages are already installed
-        let mut already_installed = Vec::new();
+        // Check which resolved packages (including dependencies) are already installed
+        let mut resolved_already_installed = Vec::new();
         let mut to_install = Vec::new();
 
         for resolved in &resolved_packages {
             let package_dir = self.node_modules_dir.join(&resolved.name);
             if package_dir.exists() {
-                already_installed.push(resolved.name.clone());
+                resolved_already_installed.push(resolved.name.clone());
             } else {
                 to_install.push(resolved);
             }
         }
 
-        // Show already installed packages
-        for package in &already_installed {
-            println!(
-                "{} {} already installed",
-                style("•").cyan(),
-                style(package).white()
-            );
+        // Show already installed dependencies only for specific installs
+        if is_specific_install {
+            for package in &resolved_already_installed {
+                if !already_installed.contains(package) {
+                    println!(
+                        "{} {} already installed",
+                        style("•").cyan(),
+                        style(package).white()
+                    );
+                }
+            }
         }
 
         if to_install.is_empty() {
+            if is_specific_install {
+                println!(
+                    "{} All packages and dependencies are already installed",
+                    style("✓").green()
+                );
+            } else {
+                println!(
+                    "{} All packages and dependencies are already installed",
+                    style("✓").green()
+                );
+                self.show_installed_packages_summary().await?;
+            }
             return Ok(());
         }
 
@@ -608,13 +654,22 @@ impl PackageManager {
             style(lock_format).dim()
         );
 
+        // Show summary of all installed packages only for package.json installs
+        if !is_specific_install {
+            self.show_installed_packages_summary().await?;
+        }
+
         Ok(())
     }
 
     /// Install a package and save it to node_modules
     pub async fn install_package(&self, package_name: &str, version: &str) -> Result<()> {
-        self.install_multiple_packages(vec![(package_name.to_string(), version.to_string())], false)
-            .await
+        self.install_multiple_packages(
+            vec![(package_name.to_string(), version.to_string())],
+            false,
+            true,
+        )
+        .await
     }
 
     /// Count total packages that will be installed (including dependencies)
@@ -722,52 +777,9 @@ impl PackageManager {
         progress.update(&format!("{} {}", style("⚡").yellow(), package_info.name));
         self.extract_package(&tarball_path, &package_dir).await?;
 
-        // Clean up the tarball and temp directory
-        if tarball_path.exists() {
-            fs::remove_file(&tarball_path).await.ok();
-        }
-        if let Some(temp_dir) = tarball_path.parent() {
-            fs::remove_dir_all(temp_dir).await.ok();
-        }
-
-        // Update package.json only if this is the explicitly requested package
-        if update_package_json {
-            self.update_package_json(&package_info.name, &package_info.version, is_dev)
-                .await?;
-        }
-
-        // Update lock file
-        let _parent_name = if update_package_json {
-            "root"
-        } else {
-            // Already set parent by caller
-            "dependency"
-        };
-
-        // Update progress bar with completion status
-        progress.update(&format!("{} {}", style("✓").green(), package_info.name));
-
-        // Download the package tarball
-        progress
-            .progress_bar
-            .set_message(format!("{} {}", style("↓").cyan(), package_info.name));
-        let tarball_path = self.download_package_tarball(package_info).await?;
-
-        // Check if tarball was actually created
-        if !tarball_path.exists() {
-            return Err(anyhow!(
-                "Failed to download tarball for {}",
-                package_info.name
-            ));
-        }
-
-        // Extract the tarball to node_modules
-        progress.progress_bar.set_message(format!(
-            "{} {}",
-            style("⚡").yellow(),
-            package_info.name
-        ));
-        self.extract_package(&tarball_path, &package_dir).await?;
+        // Setup bin commands for this package
+        self.setup_bin_commands(&package_info.name, &package_dir)
+            .await?;
 
         // Clean up the tarball and temp directory
         if tarball_path.exists() {
@@ -1154,6 +1166,9 @@ impl PackageManager {
             .progress_bar
             .set_message(format!("{} {}", style("✗").red(), package_name));
 
+        // Cleanup bin commands before removing package
+        self.cleanup_bin_commands(package_name).await?;
+
         // Remove package directory
         fs::remove_dir_all(&package_dir).await?;
 
@@ -1174,6 +1189,9 @@ impl PackageManager {
                 .check_can_remove_package(&dep_name, package_name)
                 .await?;
             if can_remove {
+                // Cleanup bin commands for dependency
+                self.cleanup_bin_commands(&dep_name).await?;
+
                 // Remove dependency from filesystem
                 let dep_dir = self.node_modules_dir.join(&dep_name);
                 if dep_dir.exists() {
@@ -1418,38 +1436,167 @@ impl PackageManager {
             return Ok(());
         }
 
-        let packages = self.get_installed_packages().await?;
+        let user_packages = self.get_user_installed_packages().await?;
+        let all_packages = self.get_installed_packages().await?;
 
-        if packages.is_empty() {
+        if all_packages.is_empty() {
             println!("{} No packages installed", style("•").yellow());
             return Ok(());
         }
 
-        println!("{} Installed packages:", style("Packages").white().bold());
-        for package in &packages {
-            // Try to read package version from its package.json
-            let version = self
-                .get_package_version(package)
-                .await
-                .unwrap_or_else(|| "unknown".to_string());
-            println!(
-                "  {} {} {}",
-                style("•").cyan(),
-                style(package).white(),
-                style(&format!("v{}", version)).dim()
-            );
+        // Show user-installed packages
+        if !user_packages.is_empty() {
+            println!("{} User-installed packages:", style("📦").blue().bold());
+            for package in &user_packages {
+                let version = self
+                    .get_package_version(package)
+                    .await
+                    .unwrap_or_else(|| "unknown".to_string());
+                println!(
+                    "  {} {} {}",
+                    style("•").cyan(),
+                    style(package).white().bold(),
+                    style(&format!("v{}", version)).dim()
+                );
+            }
+            println!();
+        }
+
+        // Show dependencies (packages not in package.json)
+        let dependencies: Vec<_> = all_packages
+            .iter()
+            .filter(|pkg| !user_packages.contains(pkg))
+            .collect();
+
+        if !dependencies.is_empty() {
+            println!("{} Dependencies:", style("🔗").dim().bold());
+            for package in &dependencies {
+                let version = self
+                    .get_package_version(package)
+                    .await
+                    .unwrap_or_else(|| "unknown".to_string());
+                println!(
+                    "  {} {} {}",
+                    style("•").dim(),
+                    style(package).dim(),
+                    style(&format!("v{}", version)).dim()
+                );
+            }
+            println!();
         }
 
         println!(
-            "\n{} {} packages total",
+            "{} {} user packages, {} dependencies ({} total)",
             style("✓").green().bold(),
-            style(packages.len()).white().bold()
+            style(user_packages.len()).white().bold(),
+            style(dependencies.len()).dim(),
+            style(all_packages.len()).white()
         );
 
         Ok(())
     }
 
-    /// Get list of installed package names
+    async fn show_installed_packages_summary(&self) -> Result<()> {
+        if !self.node_modules_dir.exists() {
+            return Ok(());
+        }
+
+        // Get user-installed packages (from package.json)
+        let user_packages = self.get_user_installed_packages().await?;
+
+        if user_packages.is_empty() {
+            return Ok(());
+        }
+
+        println!("\n{} Installed packages:", style("📋").blue());
+
+        // Show packages in a more compact format
+        let mut current_line = String::new();
+        for package in user_packages.iter() {
+            let version = self
+                .get_package_version(package)
+                .await
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let package_str = format!("{}@{}", package, version);
+
+            if current_line.is_empty() {
+                current_line = format!("  {}", package_str);
+            } else if current_line.len() + package_str.len() + 2 < 80 {
+                current_line.push_str(&format!(", {}", package_str));
+            } else {
+                println!("{}", current_line);
+                current_line = format!("  {}", package_str);
+            }
+        }
+
+        if !current_line.is_empty() {
+            println!("{}", current_line);
+        }
+
+        println!(
+            "\n{} {} packages total",
+            style("✓").green().bold(),
+            style(user_packages.len()).white().bold()
+        );
+
+        Ok(())
+    }
+
+    async fn get_user_installed_packages(&self) -> Result<Vec<String>> {
+        let mut user_packages = Vec::new();
+
+        // Read package.json to get user-installed packages
+        if self.package_json_path.exists() {
+            let content = fs::read_to_string(&self.package_json_path).await?;
+            if !content.trim().is_empty() {
+                if let Ok(package_json) = serde_json::from_str::<PackageJson>(&content) {
+                    // Add regular dependencies
+                    if let Some(dependencies) = &package_json.dependencies {
+                        for name in dependencies.keys() {
+                            let package_dir = self.node_modules_dir.join(name);
+                            if package_dir.exists() {
+                                user_packages.push(name.clone());
+                            }
+                        }
+                    }
+
+                    // Add dev dependencies
+                    if let Some(dev_dependencies) = &package_json.dev_dependencies {
+                        for name in dev_dependencies.keys() {
+                            let package_dir = self.node_modules_dir.join(name);
+                            if package_dir.exists() {
+                                user_packages.push(name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        user_packages.sort();
+        Ok(user_packages)
+    }
+
+    async fn check_packages_already_installed(
+        &self,
+        package_specs: &[(String, String)],
+    ) -> Result<(Vec<String>, Vec<(String, String)>)> {
+        let mut already_installed = Vec::new();
+        let mut to_install = Vec::new();
+
+        for (name, version) in package_specs {
+            let package_dir = self.node_modules_dir.join(name);
+            if package_dir.exists() {
+                already_installed.push(name.clone());
+            } else {
+                to_install.push((name.clone(), version.clone()));
+            }
+        }
+
+        Ok((already_installed, to_install))
+    }
+
     async fn get_installed_packages(&self) -> Result<Vec<String>> {
         let mut packages = Vec::new();
 
@@ -1649,6 +1796,370 @@ impl PackageManager {
         }
 
         Ok(package_specs)
+    }
+
+    async fn setup_bin_commands(&self, package_name: &str, package_dir: &Path) -> Result<()> {
+        // Read the package's package.json to get bin information
+        let package_json_path = package_dir.join("package.json");
+        if !package_json_path.exists() {
+            return Ok(());
+        }
+
+        let content = match fs::read_to_string(&package_json_path).await {
+            Ok(content) => content,
+            Err(_) => return Ok(()), // Skip if can't read package.json
+        };
+
+        let package_json: Value = match serde_json::from_str(&content) {
+            Ok(json) => json,
+            Err(_) => return Ok(()), // Skip if invalid JSON
+        };
+
+        if let Some(bin) = package_json.get("bin") {
+            let bin_dir = self.node_modules_dir.join(".bin");
+            if let Err(e) = fs::create_dir_all(&bin_dir).await {
+                eprintln!(
+                    "{} Failed to create .bin directory: {}",
+                    style("⚠").yellow(),
+                    e
+                );
+                return Ok(());
+            }
+
+            match bin {
+                // Handle string format: "bin": "path/to/executable"
+                Value::String(bin_path) => {
+                    let executable_name = package_name;
+                    if let Err(e) = self
+                        .create_bin_link(
+                            executable_name,
+                            package_name,
+                            bin_path,
+                            &bin_dir,
+                            package_dir,
+                        )
+                        .await
+                    {
+                        eprintln!(
+                            "{} Failed to create bin command {}: {}",
+                            style("⚠").yellow(),
+                            style(executable_name).white(),
+                            e
+                        );
+                    }
+                }
+                // Handle object format: "bin": { "command": "path/to/executable" }
+                Value::Object(bin_map) => {
+                    for (command_name, bin_path) in bin_map {
+                        if let Value::String(path_str) = bin_path {
+                            if let Err(e) = self
+                                .create_bin_link(
+                                    command_name,
+                                    package_name,
+                                    path_str,
+                                    &bin_dir,
+                                    package_dir,
+                                )
+                                .await
+                            {
+                                eprintln!(
+                                    "{} Failed to create bin command {}: {}",
+                                    style("⚠").yellow(),
+                                    style(command_name).white(),
+                                    e
+                                );
+                            } else {
+                                println!(
+                                    "{} Added bin command: {}",
+                                    style("🔧").blue(),
+                                    style(command_name).white()
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {} // Invalid bin format, skip
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn create_bin_link(
+        &self,
+        command_name: &str,
+        _package_name: &str,
+        bin_path: &str,
+        bin_dir: &Path,
+        package_dir: &Path,
+    ) -> Result<()> {
+        let source_path = package_dir.join(bin_path);
+        let link_path = bin_dir.join(command_name);
+
+        // Remove existing link if it exists
+        if link_path.exists() {
+            fs::remove_file(&link_path).await.ok();
+        }
+
+        #[cfg(unix)]
+        {
+            // On Unix systems, create a symlink and make source executable
+            use std::os::unix::fs as unix_fs;
+            use std::os::unix::fs::PermissionsExt;
+
+            // Make the source file executable if it isn't already
+            if source_path.exists() {
+                if let Ok(metadata) = fs::metadata(&source_path).await {
+                    let mut perms = metadata.permissions();
+                    perms.set_mode(perms.mode() | 0o755);
+                    let _ = fs::set_permissions(&source_path, perms).await;
+                }
+            }
+
+            unix_fs::symlink(&source_path, &link_path)?;
+        }
+
+        #[cfg(windows)]
+        {
+            // On Windows, create a batch file that calls the executable
+            let batch_content = format!(
+                "@echo off\nnode \"{}\" %*",
+                source_path.to_string_lossy().replace('/', "\\")
+            );
+            let batch_path = bin_dir.join(format!("{}.cmd", command_name));
+            fs::write(&batch_path, batch_content).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_bin_commands(&self, package_name: &str) -> Result<()> {
+        let bin_dir = self.node_modules_dir.join(".bin");
+        if !bin_dir.exists() {
+            return Ok(());
+        }
+
+        // Get the package's package.json to know which bin commands to remove
+        let package_dir = self.node_modules_dir.join(package_name);
+        let package_json_path = package_dir.join("package.json");
+
+        if package_json_path.exists() {
+            let content = fs::read_to_string(&package_json_path).await?;
+            if let Ok(package_json) = serde_json::from_str::<Value>(&content) {
+                if let Some(bin) = package_json.get("bin") {
+                    match bin {
+                        Value::String(_) => {
+                            let link_path = bin_dir.join(package_name);
+                            if link_path.exists() {
+                                fs::remove_file(&link_path).await.ok();
+                                println!(
+                                    "{} Removed bin command: {}",
+                                    style("🔧").dim(),
+                                    style(package_name).dim()
+                                );
+                            }
+                            #[cfg(windows)]
+                            {
+                                let batch_path = bin_dir.join(format!("{}.cmd", package_name));
+                                if batch_path.exists() {
+                                    fs::remove_file(&batch_path).await.ok();
+                                }
+                            }
+                        }
+                        Value::Object(bin_map) => {
+                            for command_name in bin_map.keys() {
+                                let link_path = bin_dir.join(command_name);
+                                if link_path.exists() {
+                                    fs::remove_file(&link_path).await.ok();
+                                    println!(
+                                        "{} Removed bin command: {}",
+                                        style("🔧").dim(),
+                                        style(command_name).dim()
+                                    );
+                                }
+                                #[cfg(windows)]
+                                {
+                                    let batch_path = bin_dir.join(format!("{}.cmd", command_name));
+                                    if batch_path.exists() {
+                                        fs::remove_file(&batch_path).await.ok();
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run a script from package.json
+    pub async fn run_script(&self, script_name: &str) -> Result<()> {
+        // Check if package.json exists
+        if !self.package_json_path.exists() {
+            println!("{} No package.json found", style("✗").red());
+            return Ok(());
+        }
+
+        // Read package.json
+        let content = fs::read_to_string(&self.package_json_path).await?;
+        let package_json: Value = serde_json::from_str(&content)?;
+
+        // Get scripts section
+        let scripts = match package_json.get("scripts") {
+            Some(Value::Object(scripts)) => scripts,
+            _ => {
+                println!("{} No scripts found in package.json", style("✗").red());
+                return Ok(());
+            }
+        };
+
+        // Find the requested script
+        let script_command = match scripts.get(script_name) {
+            Some(Value::String(command)) => command,
+            _ => {
+                println!(
+                    "{} Script '{}' not found",
+                    style("✗").red(),
+                    style(script_name).white()
+                );
+
+                // Show available scripts
+                if !scripts.is_empty() {
+                    println!("\n{} Available scripts:", style("Scripts").blue().bold());
+                    for (name, command) in scripts {
+                        if let Value::String(cmd) = command {
+                            println!(
+                                "  {} {} {}",
+                                style("•").cyan(),
+                                style(name).white().bold(),
+                                style(cmd).dim()
+                            );
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        };
+
+        println!(
+            "{} Running script: {} {}",
+            style("🚀").blue(),
+            style(script_name).white().bold(),
+            style(&format!("({})", script_command)).dim()
+        );
+
+        // Set up environment with .bin in PATH
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", script_command]);
+            cmd
+        } else {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            let mut cmd = Command::new(shell);
+            cmd.arg("-c").arg(script_command);
+            cmd
+        };
+
+        // Add node_modules/.bin to PATH
+        let bin_dir = self.node_modules_dir.join(".bin");
+        if bin_dir.exists() {
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            let path_separator = if cfg!(target_os = "windows") {
+                ";"
+            } else {
+                ":"
+            };
+            let new_path = if current_path.is_empty() {
+                bin_dir.to_string_lossy().to_string()
+            } else {
+                format!(
+                    "{}{}{}",
+                    bin_dir.to_string_lossy(),
+                    path_separator,
+                    current_path
+                )
+            };
+            cmd.env("PATH", new_path);
+        }
+
+        // Set working directory to project root
+        cmd.current_dir(self.package_json_path.parent().unwrap_or(Path::new(".")));
+
+        // Execute the command
+        let status = cmd.status()?;
+
+        if status.success() {
+            println!(
+                "\n{} Script '{}' completed successfully",
+                style("✓").green().bold(),
+                style(script_name).white()
+            );
+        } else {
+            println!(
+                "\n{} Script '{}' failed with exit code: {}",
+                style("✗").red().bold(),
+                style(script_name).white(),
+                status.code().unwrap_or(-1)
+            );
+        }
+
+        Ok(())
+    }
+
+    /// List all available scripts from package.json
+    pub async fn list_scripts(&self) -> Result<()> {
+        // Check if package.json exists
+        if !self.package_json_path.exists() {
+            println!("{} No package.json found", style("✗").red());
+            return Ok(());
+        }
+
+        // Read package.json
+        let content = fs::read_to_string(&self.package_json_path).await?;
+        let package_json: Value = serde_json::from_str(&content)?;
+
+        // Get scripts section
+        let scripts = match package_json.get("scripts") {
+            Some(Value::Object(scripts)) => scripts,
+            _ => {
+                println!("{} No scripts found in package.json", style("•").yellow());
+                return Ok(());
+            }
+        };
+
+        if scripts.is_empty() {
+            println!("{} No scripts found in package.json", style("•").yellow());
+            return Ok(());
+        }
+
+        println!("{} Available scripts:", style("Scripts").blue().bold());
+
+        // Sort scripts by name for consistent output
+        let mut sorted_scripts: Vec<_> = scripts.iter().collect();
+        sorted_scripts.sort_by_key(|(name, _)| *name);
+
+        for (name, command) in sorted_scripts {
+            if let Value::String(cmd) = command {
+                println!(
+                    "  {} {} {}",
+                    style("•").cyan(),
+                    style(name).white().bold(),
+                    style(cmd).dim()
+                );
+            }
+        }
+
+        println!(
+            "\n{} Run a script with: {} {}",
+            style("💡").yellow(),
+            style("clay run").cyan(),
+            style("<script-name>").dim()
+        );
+
+        Ok(())
     }
 }
 
