@@ -426,27 +426,39 @@ pub struct PackageManager {
     semaphore: Arc<Semaphore>,
     file_mutex: Arc<Mutex<()>>,
     cache_dir: PathBuf,
+    use_toml_lock: bool,
 }
 
 impl PackageManager {
     pub fn new() -> Self {
+        Self::with_toml_lock(true)
+    }
+
+    pub fn with_toml_lock(use_toml: bool) -> Self {
         let cache_dir = Self::get_cache_dir();
+        let lock_file_path = if use_toml {
+            PathBuf::from("clay-lock.toml")
+        } else {
+            PathBuf::from("clay-lock.json")
+        };
+
         Self {
             npm_client: NpmClient::new(),
             node_modules_dir: PathBuf::from("node_modules"),
             package_json_path: PathBuf::from("package.json"),
-            lock_file_path: PathBuf::from("fnpm-lock.json"),
+            lock_file_path,
             semaphore: Arc::new(Semaphore::new(8)), // Limit concurrent downloads
             file_mutex: Arc::new(Mutex::new(())),
             cache_dir,
+            use_toml_lock: use_toml,
         }
     }
 
     fn get_cache_dir() -> PathBuf {
         if let Some(home) = dirs::home_dir() {
-            home.join(".fnpm").join("cache")
+            home.join(".clay").join("cache")
         } else {
-            PathBuf::from(".fnpm-cache")
+            PathBuf::from(".clay-cache")
         }
     }
 
@@ -553,11 +565,14 @@ impl PackageManager {
                 .collect::<Vec<_>>(),
         );
 
+        let lock_format = if self.use_toml_lock { "TOML" } else { "JSON" };
+
         println!(
-            "{} Installing {} packages (including {} dependencies)...",
+            "{} Installing {} packages (including {} dependencies) [{}]...",
             style("📦").green(),
             to_install.len(),
-            total_packages - to_install.len() as u64
+            total_packages - to_install.len() as u64,
+            style(lock_format).dim()
         );
 
         // Phase 3: Install with progress tracking
@@ -584,6 +599,14 @@ impl PackageManager {
                 style(to_install.len()).white().bold()
             );
         }
+
+        // Show lock file format used
+        let lock_format = if self.use_toml_lock { "TOML" } else { "JSON" };
+        println!(
+            "{} Lock file updated ({})",
+            style("📄").blue(),
+            style(lock_format).dim()
+        );
 
         Ok(())
     }
@@ -1285,8 +1308,11 @@ impl PackageManager {
             if content.trim().is_empty() {
                 Ok(LockFile::new())
             } else {
-                let lock_file: LockFile =
-                    serde_json::from_str(&content).unwrap_or_else(|_| LockFile::new());
+                let lock_file: LockFile = if self.use_toml_lock {
+                    toml::from_str(&content).unwrap_or_else(|_| LockFile::new())
+                } else {
+                    serde_json::from_str(&content).unwrap_or_else(|_| LockFile::new())
+                };
                 Ok(lock_file)
             }
         } else {
@@ -1297,8 +1323,13 @@ impl PackageManager {
     /// Save lock file
     async fn save_lock_file(&self, lock_file: &LockFile) -> Result<()> {
         let _lock = self.file_mutex.lock().await;
-        let content = serde_json::to_string_pretty(lock_file)?;
+        let content = if self.use_toml_lock {
+            toml::to_string_pretty(lock_file)?
+        } else {
+            serde_json::to_string_pretty(lock_file)?
+        };
         fs::write(&self.lock_file_path, content).await?;
+
         Ok(())
     }
 
@@ -1447,7 +1478,7 @@ impl PackageManager {
 
         if let Ok(content) = fs::read_to_string(&package_json_path).await {
             if let Ok(package_json) = serde_json::from_str::<PackageJson>(&content) {
-                return Some(package_json.version);
+                return package_json.version;
             }
         }
 

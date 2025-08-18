@@ -8,8 +8,8 @@ mod package_manager;
 use package_manager::PackageManager;
 
 #[derive(Parser)]
-#[command(name = "fnpm")]
-#[command(about = "A fast, modern Node.js package manager")]
+#[command(name = "clay")]
+#[command(about = "Clay - A fast, modern Node.js package manager built in Rust")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -30,6 +30,9 @@ enum Commands {
         /// Install as development dependencies
         #[arg(long)]
         dev: bool,
+        /// Use JSON format for lock file instead of TOML
+        #[arg(long)]
+        json: bool,
     },
     /// Remove packages and clean up dependencies
     Uninstall {
@@ -56,10 +59,15 @@ enum CacheCommands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let package_manager = PackageManager::new();
 
     match cli.command {
-        Commands::Install { packages, dev } => {
+        Commands::Install {
+            packages,
+            dev,
+            json,
+        } => {
+            let package_manager = PackageManager::with_toml_lock(!json);
+
             let package_specs = if packages.is_empty() {
                 // Read dependencies from package.json
                 package_manager.get_package_json_dependencies(dev).await?
@@ -92,24 +100,29 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Commands::Uninstall { packages } => {
+            let package_manager = PackageManager::new();
             for package_name in packages {
                 package_manager.uninstall_package(&package_name).await?;
             }
         }
         Commands::List => {
+            let package_manager = PackageManager::new();
             package_manager.list_installed_packages().await?;
         }
-        Commands::Cache(cache_cmd) => match cache_cmd {
-            CacheCommands::Info => {
-                package_manager.cache_info().await?;
+        Commands::Cache(cache_cmd) => {
+            let package_manager = PackageManager::new();
+            match cache_cmd {
+                CacheCommands::Info => {
+                    package_manager.cache_info().await?;
+                }
+                CacheCommands::Clear => {
+                    package_manager.cache_clear().await?;
+                }
+                CacheCommands::Dir => {
+                    package_manager.cache_dir().await?;
+                }
             }
-            CacheCommands::Clear => {
-                package_manager.cache_clear().await?;
-            }
-            CacheCommands::Dir => {
-                package_manager.cache_dir().await?;
-            }
-        },
+        }
     }
 
     Ok(())

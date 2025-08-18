@@ -43,8 +43,8 @@ impl NpmRegistryResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PackageJson {
-    pub name: String,
-    pub version: String,
+    pub name: Option<String>,
+    pub version: Option<String>,
     pub description: Option<String>,
     pub main: Option<String>,
     pub dependencies: Option<HashMap<String, String>>,
@@ -55,8 +55,8 @@ pub struct PackageJson {
 impl PackageJson {
     pub fn new() -> Self {
         Self {
-            name: "my-project".to_string(),
-            version: "1.0.0".to_string(),
+            name: Some("my-project".to_string()),
+            version: Some("1.0.0".to_string()),
             description: None,
             main: Some("index.js".to_string()),
             dependencies: Some(HashMap::new()),
