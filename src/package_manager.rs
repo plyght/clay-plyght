@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::{HashMap, HashSet};
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,7 +12,329 @@ use tokio::fs;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::npm_client::NpmClient;
-use crate::package_info::{LockFile, PackageJson};
+use crate::package_info::{DistInfo, LockFile, NpmRegistryResponse, PackageInfo, PackageJson};
+
+#[derive(Debug, Clone)]
+pub struct ResolvedPackage {
+    pub name: String,
+    pub version: String,
+    pub info: PackageInfo,
+    pub dependencies: Vec<ResolvedPackage>,
+    pub is_dev: bool,
+}
+
+pub struct PackageResolver {
+    npm_client: NpmClient,
+    resolved_cache: HashMap<String, NpmRegistryResponse>,
+    resolution_stack: HashSet<String>,
+}
+
+impl PackageResolver {
+    fn new(npm_client: NpmClient) -> Self {
+        Self {
+            npm_client,
+            resolved_cache: HashMap::new(),
+            resolution_stack: HashSet::new(),
+        }
+    }
+
+    async fn resolve_package(
+        &mut self,
+        name: &str,
+        version_spec: &str,
+        is_dev: bool,
+    ) -> Result<ResolvedPackage> {
+        self.resolve_package_iterative(name, version_spec, is_dev)
+            .await
+    }
+
+    async fn resolve_package_iterative(
+        &mut self,
+        root_name: &str,
+        root_version_spec: &str,
+        root_is_dev: bool,
+    ) -> Result<ResolvedPackage> {
+        use std::io::{self, Write};
+
+        // Stack for iterative processing: (name, version_spec, is_dev, parent_path)
+        let mut work_stack = vec![(
+            root_name.to_string(),
+            root_version_spec.to_string(),
+            root_is_dev,
+            String::new(),
+        )];
+        let mut resolved_packages: HashMap<String, ResolvedPackage> = HashMap::new();
+        let mut dependency_graph: HashMap<String, Vec<String>> = HashMap::new();
+
+        while let Some((name, version_spec, is_dev, _parent_path)) = work_stack.pop() {
+            let package_key = format!("{}@{}", name, version_spec);
+
+            // Check for circular dependency
+            if self.resolution_stack.contains(&package_key) {
+                print!(
+                    "\r  {} Circular dependency detected for {}{}",
+                    style("⚠").yellow(),
+                    style(&name).white(),
+                    " ".repeat(30)
+                );
+                println!();
+                continue;
+            }
+
+            // Skip if already resolved
+            if resolved_packages.contains_key(&package_key) {
+                continue;
+            }
+
+            self.resolution_stack.insert(package_key.clone());
+
+            print!(
+                "\r{} Resolving {}{}...{}",
+                style("🔍").cyan(),
+                style(&name).white(),
+                if version_spec != "latest" {
+                    format!("@{}", style(&version_spec).dim())
+                } else {
+                    String::new()
+                },
+                " ".repeat(30)
+            );
+            io::stdout().flush().unwrap();
+
+            // Fetch package info
+            if !self.resolved_cache.contains_key(&name) {
+                let response = self.npm_client.get_package_info(&name).await?;
+                self.resolved_cache.insert(name.clone(), response);
+            }
+            let registry_response = self.resolved_cache.get(&name).unwrap();
+
+            // Resolve version
+            let package_info = if version_spec == "latest" {
+                registry_response.get_latest_version()
+            } else if Self::is_exact_version(&version_spec) {
+                registry_response.get_version(&version_spec)
+            } else {
+                // For ranges, use latest for now
+                registry_response.get_latest_version()
+            }
+            .ok_or_else(|| {
+                anyhow!(
+                    "Version '{}' not found for package '{}'",
+                    version_spec,
+                    name
+                )
+            })?;
+
+            let package_info = package_info.clone();
+
+            print!("\r{}", " ".repeat(80));
+            print!("\r");
+            io::stdout().flush().unwrap();
+
+            // Add dependencies to work stack
+            let mut dep_keys = Vec::new();
+            if let Some(ref deps) = package_info.dependencies {
+                for (dep_name, dep_version) in deps {
+                    let dep_key = format!("{}@{}", dep_name, dep_version);
+                    dep_keys.push(dep_key.clone());
+                    work_stack.push((
+                        dep_name.clone(),
+                        dep_version.clone(),
+                        false,
+                        package_key.clone(),
+                    ));
+                }
+            }
+
+            dependency_graph.insert(package_key.clone(), dep_keys);
+
+            // Create resolved package with empty dependencies for now
+            let resolved_pkg = ResolvedPackage {
+                name: name.clone(),
+                version: package_info.version.clone(),
+                info: package_info,
+                dependencies: Vec::new(), // Will be filled later
+                is_dev,
+            };
+
+            resolved_packages.insert(package_key.clone(), resolved_pkg);
+            self.resolution_stack.remove(&package_key);
+        }
+
+        // Build dependency tree
+        let root_key = format!("{}@{}", root_name, root_version_spec);
+        self.build_dependency_tree(&root_key, &resolved_packages, &dependency_graph)
+    }
+
+    fn build_dependency_tree(
+        &self,
+        package_key: &str,
+        resolved_packages: &HashMap<String, ResolvedPackage>,
+        dependency_graph: &HashMap<String, Vec<String>>,
+    ) -> Result<ResolvedPackage> {
+        let mut visited = HashSet::new();
+        self.build_tree_recursive(
+            package_key,
+            resolved_packages,
+            dependency_graph,
+            &mut visited,
+        )
+    }
+
+    fn build_tree_recursive(
+        &self,
+        package_key: &str,
+        resolved_packages: &HashMap<String, ResolvedPackage>,
+        dependency_graph: &HashMap<String, Vec<String>>,
+        visited: &mut HashSet<String>,
+    ) -> Result<ResolvedPackage> {
+        if visited.contains(package_key) {
+            // Return a stub for circular dependencies
+            return Ok(ResolvedPackage {
+                name: "circular".to_string(),
+                version: "0.0.0".to_string(),
+                info: PackageInfo {
+                    name: "circular".to_string(),
+                    version: "0.0.0".to_string(),
+                    description: None,
+                    main: None,
+                    dist: DistInfo {
+                        tarball: String::new(),
+                        shasum: String::new(),
+                    },
+                    dependencies: None,
+                },
+                dependencies: Vec::new(),
+                is_dev: false,
+            });
+        }
+
+        visited.insert(package_key.to_string());
+
+        let mut pkg = resolved_packages
+            .get(package_key)
+            .ok_or_else(|| anyhow!("Package not found: {}", package_key))?
+            .clone();
+
+        if let Some(dep_keys) = dependency_graph.get(package_key) {
+            let mut dependencies = Vec::new();
+            for dep_key in dep_keys {
+                if let Ok(dep) =
+                    self.build_tree_recursive(dep_key, resolved_packages, dependency_graph, visited)
+                {
+                    dependencies.push(dep);
+                }
+            }
+            pkg.dependencies = dependencies;
+        }
+
+        visited.remove(package_key);
+        Ok(pkg)
+    }
+
+    fn is_exact_version(version: &str) -> bool {
+        if version.starts_with('^')
+            || version.starts_with('~')
+            || version.starts_with('>')
+            || version.starts_with('<')
+            || version.starts_with('=')
+            || version == "*"
+        {
+            return false;
+        }
+
+        let parts: Vec<&str> = version.split('.').collect();
+        if parts.len() >= 3 {
+            parts.iter().take(3).all(|part| {
+                part.split('-')
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+            })
+        } else {
+            false
+        }
+    }
+
+    pub async fn resolve_multiple_packages(
+        &mut self,
+        packages: Vec<(String, String, bool)>, // name, version, is_dev
+    ) -> Result<Vec<ResolvedPackage>> {
+        let mut resolved = Vec::new();
+
+        for (name, version, is_dev) in packages {
+            print!(
+                "\r{} Resolving {}{}...{}",
+                style("🔍").blue(),
+                style(&name).white().bold(),
+                if version != "latest" {
+                    format!("@{}", style(&version).dim())
+                } else {
+                    String::new()
+                },
+                " ".repeat(30)
+            );
+            use std::io::{self, Write};
+            io::stdout().flush().unwrap();
+
+            match self.resolve_package(&name, &version, is_dev).await {
+                Ok(resolved_pkg) => {
+                    print!("\r{}", " ".repeat(80));
+                    print!("\r");
+                    io::stdout().flush().unwrap();
+                    resolved.push(resolved_pkg);
+                }
+                Err(e) => {
+                    print!("\r{}", " ".repeat(80));
+                    print!(
+                        "\r{} Failed to resolve {}: {}\n",
+                        style("✗").red().bold(),
+                        style(&name).white().bold(),
+                        style(e.to_string()).dim()
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // Show resolution summary
+        if !resolved.is_empty() {
+            println!(
+                "{} Resolved {} packages successfully",
+                style("📦").green(),
+                style(resolved.len().to_string()).green().bold()
+            );
+        }
+
+        Ok(resolved)
+    }
+
+    pub fn count_total_packages(resolved: &[ResolvedPackage]) -> u64 {
+        let mut count = 0;
+        let mut visited = std::collections::HashSet::new();
+
+        fn count_recursive(
+            pkg: &ResolvedPackage,
+            visited: &mut std::collections::HashSet<String>,
+            count: &mut u64,
+        ) {
+            if !visited.insert(pkg.name.clone()) {
+                return; // Already counted
+            }
+            *count += 1;
+            for dep in &pkg.dependencies {
+                count_recursive(dep, visited, count);
+            }
+        }
+
+        for pkg in resolved {
+            count_recursive(pkg, &mut visited, &mut count);
+        }
+
+        count
+    }
+}
 
 struct ProgressTracker {
     progress_bar: ProgressBar,
@@ -92,30 +415,99 @@ impl PackageManager {
         }
     }
 
-    /// Install a package and save it to node_modules
-    pub async fn install_package(&self, package_name: &str, version: &str) -> Result<()> {
-        // First, count total packages to install
-        let total_packages = self
-            .count_packages_to_install(package_name, version)
-            .await?;
+    /// Install multiple packages with unified progress
+    pub async fn install_multiple_packages(
+        &self,
+        packages: Vec<(String, String)>,
+        is_dev: bool,
+    ) -> Result<()> {
+        let mut resolver = PackageResolver::new(self.npm_client.clone());
+        let package_specs: Vec<(String, String, bool)> = packages
+            .into_iter()
+            .map(|(name, version)| (name, version, is_dev))
+            .collect();
 
-        // Create progress tracker
+        let resolved_packages = resolver.resolve_multiple_packages(package_specs).await?;
+
+        if resolved_packages.is_empty() {
+            println!("{} No valid packages to install", style("•").yellow());
+            return Ok(());
+        }
+
+        // Check which packages are already installed
+        let mut already_installed = Vec::new();
+        let mut to_install = Vec::new();
+
+        for resolved in &resolved_packages {
+            let package_dir = self.node_modules_dir.join(&resolved.name);
+            if package_dir.exists() {
+                already_installed.push(resolved.name.clone());
+            } else {
+                to_install.push(resolved);
+            }
+        }
+
+        // Show already installed packages
+        for package in &already_installed {
+            println!(
+                "{} {} already installed",
+                style("•").cyan(),
+                style(package).white()
+            );
+        }
+
+        if to_install.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 2: Count total packages (including dependencies)
+        let total_packages = PackageResolver::count_total_packages(
+            &to_install
+                .iter()
+                .map(|&pkg| pkg)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+
+        println!(
+            "{} Installing {} packages (including {} dependencies)...",
+            style("📦").green(),
+            to_install.len(),
+            total_packages - to_install.len() as u64
+        );
+
+        // Phase 3: Install with progress tracking
         let mut progress = ProgressTracker::new(total_packages);
 
-        // Install with progress tracking
-        self.install_package_with_progress(package_name, version, true, &mut progress)
-            .await?;
+        for resolved_pkg in &to_install {
+            self.install_resolved_package(resolved_pkg, true, &mut progress)
+                .await?;
+        }
 
         progress.finish();
 
         // Show summary
-        println!(
-            "\n{} Successfully installed {}",
-            style("✓").green().bold(),
-            style(package_name).white().bold()
-        );
+        if to_install.len() == 1 {
+            println!(
+                "\n{} Successfully installed {}",
+                style("✓").green().bold(),
+                style(&to_install[0].name).white().bold()
+            );
+        } else {
+            println!(
+                "\n{} Successfully installed {} packages",
+                style("✓").green().bold(),
+                style(to_install.len()).white().bold()
+            );
+        }
 
         Ok(())
+    }
+
+    /// Install a package and save it to node_modules
+    pub async fn install_package(&self, package_name: &str, version: &str) -> Result<()> {
+        self.install_multiple_packages(vec![(package_name.to_string(), version.to_string())], false)
+            .await
     }
 
     /// Count total packages that will be installed (including dependencies)
@@ -150,47 +542,103 @@ impl PackageManager {
         Ok(count)
     }
 
-    /// Internal install method with option to update package.json
-    async fn install_package_with_progress(
+    /// Install a resolved package with its dependencies
+    async fn install_resolved_package(
         &self,
-        package_name: &str,
-        version: &str,
+        resolved_pkg: &ResolvedPackage,
         update_package_json: bool,
         progress: &mut ProgressTracker,
     ) -> Result<()> {
+        // Check if already installed
+        let package_dir = self.node_modules_dir.join(&resolved_pkg.name);
+        if package_dir.exists() {
+            progress.update(&format!(
+                "{} {} (cached)",
+                style("•").cyan(),
+                resolved_pkg.name
+            ));
+            return Ok(());
+        }
+
+        // Install dependencies first
+        for dep in &resolved_pkg.dependencies {
+            Box::pin(self.install_resolved_package(dep, false, progress)).await?;
+        }
+
+        // Install this package
+        self.install_single_package(
+            &resolved_pkg.info,
+            update_package_json,
+            resolved_pkg.is_dev,
+            progress,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Install a single package without dependency resolution
+    async fn install_single_package(
+        &self,
+        package_info: &PackageInfo,
+        update_package_json: bool,
+        is_dev: bool,
+        progress: &mut ProgressTracker,
+    ) -> Result<()> {
+        // Skip circular dependency stubs
+        if package_info.name == "circular" {
+            return Ok(());
+        }
+
         // Ensure node_modules directory exists
         self.ensure_node_modules_exists().await?;
-
-        // Fetch package information from NPM registry
-        progress
-            .progress_bar
-            .set_message(format!("Fetching {}", package_name));
-        let registry_response = self.npm_client.get_package_info(package_name).await?;
-
-        let package_info = if version == "latest" {
-            registry_response.get_latest_version()
-        } else {
-            registry_response.get_version(version)
-        };
-
-        let package_info = package_info.ok_or_else(|| {
-            anyhow!(
-                "Version '{}' not found for package '{}'",
-                version,
-                package_name
-            )
-        })?;
 
         // Check if package is already installed
         let package_dir = self.node_modules_dir.join(&package_info.name);
         if package_dir.exists() {
-            println!(
-                "{} {} already installed",
-                style("•").cyan(),
-                style(&package_info.name).white()
-            );
             return Ok(());
         }
+
+        // Download the package tarball
+        progress.update(&format!("{} {}", style("↓").cyan(), package_info.name));
+        let tarball_path = self.download_package_tarball(package_info).await?;
+
+        // Check if tarball was actually created
+        if !tarball_path.exists() {
+            return Err(anyhow!(
+                "Failed to download tarball for {}",
+                package_info.name
+            ));
+        }
+
+        // Extract the tarball to node_modules
+        progress.update(&format!("{} {}", style("⚡").yellow(), package_info.name));
+        self.extract_package(&tarball_path, &package_dir).await?;
+
+        // Clean up the tarball and temp directory
+        if tarball_path.exists() {
+            fs::remove_file(&tarball_path).await.ok();
+        }
+        if let Some(temp_dir) = tarball_path.parent() {
+            fs::remove_dir_all(temp_dir).await.ok();
+        }
+
+        // Update package.json only if this is the explicitly requested package
+        if update_package_json {
+            self.update_package_json(&package_info.name, &package_info.version, is_dev)
+                .await?;
+        }
+
+        // Update lock file
+        let _parent_name = if update_package_json {
+            "root"
+        } else {
+            // Already set parent by caller
+            "dependency"
+        };
+
+        // Update progress bar with completion status
+        progress.update(&format!("{} {}", style("✓").green(), package_info.name));
 
         // Download the package tarball
         progress
@@ -224,7 +672,7 @@ impl PackageManager {
 
         // Update package.json only if this is the explicitly requested package
         if update_package_json {
-            self.update_package_json(&package_info.name, &package_info.version)
+            self.update_package_json(&package_info.name, &package_info.version, is_dev)
                 .await?;
         }
 
@@ -232,8 +680,8 @@ impl PackageManager {
         let parent_name = if update_package_json {
             "root"
         } else {
-            // Find the actual parent package name from the call stack
-            package_name
+            // For dependency packages, use the package name as parent
+            &package_info.name
         };
 
         self.update_lock_file(
@@ -501,44 +949,68 @@ impl PackageManager {
             serde_json::from_str(&content).unwrap_or_else(|_| PackageJson::new())
         };
 
-        if let Some(dependencies) = package_json.dependencies {
-            if dependencies.is_empty() {
-                println!("{} No dependencies in package.json", style("•").yellow());
-                return Ok(());
-            }
+        let mut total_packages = 0;
+        let mut has_deps = false;
 
-            // Count total packages to install
-            let mut total_packages = 0;
-            for (dep_name, _) in &dependencies {
-                let dep_package_dir = self.node_modules_dir.join(dep_name);
-                if !dep_package_dir.exists() {
-                    total_packages += 1;
+        // Count regular dependencies
+        if let Some(dependencies) = &package_json.dependencies {
+            if !dependencies.is_empty() {
+                has_deps = true;
+                for (dep_name, _) in dependencies {
+                    let dep_package_dir = self.node_modules_dir.join(dep_name);
+                    if !dep_package_dir.exists() {
+                        total_packages += 1;
+                    }
                 }
             }
+        }
 
-            if total_packages == 0 {
-                println!("{} All dependencies already installed", style("✓").green());
-                return Ok(());
+        // Count dev dependencies
+        if let Some(dev_dependencies) = &package_json.dev_dependencies {
+            if !dev_dependencies.is_empty() {
+                has_deps = true;
+                for (dep_name, _) in dev_dependencies {
+                    let dep_package_dir = self.node_modules_dir.join(dep_name);
+                    if !dep_package_dir.exists() {
+                        total_packages += 1;
+                    }
+                }
             }
+        }
 
-            // Create progress tracker
-            let mut progress = ProgressTracker::new(total_packages);
+        if !has_deps {
+            println!("{} No dependencies in package.json", style("•").yellow());
+            return Ok(());
+        }
 
-            // Install dependencies in parallel
+        if total_packages == 0 {
+            println!("{} All dependencies already installed", style("✓").green());
+            return Ok(());
+        }
+
+        // Create progress tracker
+        let mut progress = ProgressTracker::new(total_packages);
+
+        // Install regular dependencies
+        if let Some(dependencies) = package_json.dependencies {
             self.install_dependencies_parallel(&dependencies, "root", &mut progress)
                 .await?;
-
-            progress.finish();
-
-            // Show summary
-            println!(
-                "\n{} Installed {} dependencies",
-                style("✓").green().bold(),
-                style(total_packages).white().bold()
-            );
-        } else {
-            println!("{} No dependencies in package.json", style("•").yellow());
         }
+
+        // Install dev dependencies
+        if let Some(dev_dependencies) = package_json.dev_dependencies {
+            self.install_dependencies_parallel(&dev_dependencies, "root", &mut progress)
+                .await?;
+        }
+
+        progress.finish();
+
+        // Show summary
+        println!(
+            "\n{} Installed {} dependencies",
+            style("✓").green().bold(),
+            style(total_packages).white().bold()
+        );
 
         Ok(())
     }
@@ -551,7 +1023,7 @@ impl PackageManager {
         if !package_dir.exists() {
             println!(
                 "{} {} is not installed",
-                style("•").yellow(),
+                style("•").dim(),
                 style(package_name).white()
             );
             return Ok(());
@@ -672,7 +1144,12 @@ impl PackageManager {
     }
 
     /// Update or create package.json with the new dependency
-    async fn update_package_json(&self, package_name: &str, version: &str) -> Result<()> {
+    async fn update_package_json(
+        &self,
+        package_name: &str,
+        version: &str,
+        is_dev: bool,
+    ) -> Result<()> {
         let _lock = self.file_mutex.lock().await;
         let mut package_json = if self.package_json_path.exists() {
             let content = fs::read_to_string(&self.package_json_path).await?;
@@ -686,7 +1163,11 @@ impl PackageManager {
         };
 
         // Add the dependency
-        package_json.add_dependency(package_name, version);
+        if is_dev {
+            package_json.add_dev_dependency(package_name, version);
+        } else {
+            package_json.add_dependency(package_name, version);
+        }
 
         // Write back to package.json
         let content = serde_json::to_string_pretty(&package_json)?;

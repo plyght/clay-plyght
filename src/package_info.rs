@@ -17,7 +17,7 @@ pub struct DistInfo {
     pub shasum: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NpmRegistryResponse {
     pub name: String,
     pub versions: HashMap<String, PackageInfo>,
@@ -71,6 +71,16 @@ impl PackageJson {
             let mut deps = HashMap::new();
             deps.insert(name.to_string(), version.to_string());
             self.dependencies = Some(deps);
+        }
+    }
+
+    pub fn add_dev_dependency(&mut self, name: &str, version: &str) {
+        if let Some(ref mut deps) = self.dev_dependencies {
+            deps.insert(name.to_string(), version.to_string());
+        } else {
+            let mut deps = HashMap::new();
+            deps.insert(name.to_string(), version.to_string());
+            self.dev_dependencies = Some(deps);
         }
     }
 }

@@ -20,19 +20,21 @@ struct Cli {
 enum Commands {
     /// Install packages with parallel downloads
     #[command(
-        long_about = "Install a package with integrity verification and parallel dependency resolution.\nIf no package is specified, installs all dependencies from package.json."
+        alias = "i",
+        alias = "add",
+        long_about = "Install packages with integrity verification and parallel dependency resolution.\nIf no package is specified, installs all dependencies from package.json.\nUse package@version syntax to specify versions (e.g. lodash@4.17.21)."
     )]
     Install {
-        /// Package name to install
-        package: Option<String>,
-        /// Specific version to install
-        #[arg(short, long)]
-        version: Option<String>,
+        /// Package names to install (use package@version for specific versions)
+        packages: Vec<String>,
+        /// Install as development dependencies
+        #[arg(long)]
+        dev: bool,
     },
     /// Remove packages and clean up dependencies
     Uninstall {
-        /// Package name to remove
-        package: String,
+        /// Package names to remove
+        packages: Vec<String>,
     },
     /// Show installed packages
     List,
@@ -44,20 +46,41 @@ async fn main() -> Result<()> {
     let package_manager = PackageManager::new();
 
     match cli.command {
-        Commands::Install { package, version } => {
-            if let Some(package_name) = package {
-                // Install specific package
-                let version_str = version.unwrap_or_else(|| "latest".to_string());
-                package_manager
-                    .install_package(&package_name, &version_str)
-                    .await?;
-            } else {
+        Commands::Install { packages, dev } => {
+            if packages.is_empty() {
                 // Install dependencies from package.json
                 package_manager.install_dependencies().await?;
+            } else {
+                // Parse package specifications
+                let mut package_specs = Vec::new();
+                for package_spec in packages {
+                    let (package_name, version) = if let Some(at_pos) = package_spec.rfind('@') {
+                        if at_pos > 0 {
+                            // Split at the last @ symbol
+                            let name = &package_spec[..at_pos];
+                            let version = &package_spec[at_pos + 1..];
+                            (name.to_string(), version.to_string())
+                        } else {
+                            // @ at the beginning, treat as package name
+                            (package_spec, "latest".to_string())
+                        }
+                    } else {
+                        // No @ symbol, use latest version
+                        (package_spec, "latest".to_string())
+                    };
+                    package_specs.push((package_name, version));
+                }
+
+                // Install all packages with unified interface
+                package_manager
+                    .install_multiple_packages(package_specs, dev)
+                    .await?;
             }
         }
-        Commands::Uninstall { package } => {
-            package_manager.uninstall_package(&package).await?;
+        Commands::Uninstall { packages } => {
+            for package_name in packages {
+                package_manager.uninstall_package(&package_name).await?;
+            }
         }
         Commands::List => {
             package_manager.list_installed_packages().await?;
