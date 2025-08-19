@@ -68,7 +68,7 @@ impl PackageResolver {
         let mut dependency_graph: HashMap<String, Vec<String>> = HashMap::new();
 
         while let Some((name, version_spec, is_dev, _parent_path)) = work_stack.pop() {
-            let package_key = format!("{}@{}", name, version_spec);
+            let package_key = format!("{name}@{version_spec}");
 
             // Check for circular dependency
             if self.resolution_stack.contains(&package_key) {
@@ -144,7 +144,7 @@ impl PackageResolver {
             let mut dep_keys = Vec::new();
             if let Some(ref deps) = package_info.dependencies {
                 for (dep_name, dep_version) in deps {
-                    let dep_key = format!("{}@{}", dep_name, dep_version);
+                    let dep_key = format!("{dep_name}@{dep_version}");
                     dep_keys.push(dep_key.clone());
                     work_stack.push((
                         dep_name.clone(),
@@ -179,7 +179,7 @@ impl PackageResolver {
         );
         io::stdout().flush().unwrap();
 
-        let root_key = format!("{}@{}", root_name, root_version_spec);
+        let root_key = format!("{root_name}@{root_version_spec}");
         let result = self.build_dependency_tree(&root_key, &resolved_packages, &dependency_graph);
 
         // Clear the building tree message completely
@@ -204,6 +204,7 @@ impl PackageResolver {
         )
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn build_tree_recursive(
         &self,
         package_key: &str,
@@ -306,7 +307,7 @@ impl PackageResolver {
                         style(&resolved_pkg.version).dim(),
                         " ".repeat(50)
                     );
-                    print!("\n");
+                    println!();
                     io::stdout().flush().unwrap();
                     resolved.push(resolved_pkg);
                 }
@@ -605,8 +606,7 @@ impl PackageManager {
         // Phase 2: Count total packages (including dependencies)
         let total_packages = PackageResolver::count_total_packages(
             &to_install
-                .iter()
-                .map(|&pkg| pkg)
+                .iter().copied()
                 .cloned()
                 .collect::<Vec<_>>(),
         );
@@ -663,6 +663,7 @@ impl PackageManager {
     }
 
     /// Install a package and save it to node_modules
+    #[allow(dead_code)]
     pub async fn install_package(&self, package_name: &str, version: &str) -> Result<()> {
         self.install_multiple_packages(
             vec![(package_name.to_string(), version.to_string())],
@@ -673,6 +674,7 @@ impl PackageManager {
     }
 
     /// Count total packages that will be installed (including dependencies)
+    #[allow(dead_code)]
     async fn count_packages_to_install(&self, package_name: &str, version: &str) -> Result<u64> {
         let mut count = 0;
 
@@ -691,7 +693,7 @@ impl PackageManager {
 
             if let Some(package_info) = package_info {
                 if let Some(ref dependencies) = package_info.dependencies {
-                    for (dep_name, _) in dependencies {
+                    for dep_name in dependencies.keys() {
                         let dep_package_dir = self.node_modules_dir.join(dep_name);
                         if !dep_package_dir.exists() {
                             count += 1;
@@ -1055,6 +1057,7 @@ impl PackageManager {
     }
 
     /// Install all dependencies from package.json
+    #[allow(dead_code)]
     pub async fn install_dependencies(&self) -> Result<()> {
         if !self.package_json_path.exists() {
             println!("{} No package.json found", style("•").yellow());
@@ -1075,7 +1078,7 @@ impl PackageManager {
         if let Some(dependencies) = &package_json.dependencies {
             if !dependencies.is_empty() {
                 has_deps = true;
-                for (dep_name, _) in dependencies {
+                for dep_name in dependencies.keys() {
                     let dep_package_dir = self.node_modules_dir.join(dep_name);
                     if !dep_package_dir.exists() {
                         total_packages += 1;
@@ -1088,7 +1091,7 @@ impl PackageManager {
         if let Some(dev_dependencies) = &package_json.dev_dependencies {
             if !dev_dependencies.is_empty() {
                 has_deps = true;
-                for (dep_name, _) in dev_dependencies {
+                for dep_name in dev_dependencies.keys() {
                     let dep_package_dir = self.node_modules_dir.join(dep_name);
                     if !dep_package_dir.exists() {
                         total_packages += 1;
@@ -1456,7 +1459,7 @@ impl PackageManager {
                     "  {} {} {}",
                     style("•").cyan(),
                     style(package).white().bold(),
-                    style(&format!("v{}", version)).dim()
+                    style(&format!("v{version}")).dim()
                 );
             }
             println!();
@@ -1479,7 +1482,7 @@ impl PackageManager {
                     "  {} {} {}",
                     style("•").dim(),
                     style(package).dim(),
-                    style(&format!("v{}", version)).dim()
+                    style(&format!("v{version}")).dim()
                 );
             }
             println!();
@@ -1518,20 +1521,20 @@ impl PackageManager {
                 .await
                 .unwrap_or_else(|| "unknown".to_string());
 
-            let package_str = format!("{}@{}", package, version);
+            let package_str = format!("{package}@{version}");
 
             if current_line.is_empty() {
-                current_line = format!("  {}", package_str);
+                current_line = format!("  {package_str}");
             } else if current_line.len() + package_str.len() + 2 < 80 {
-                current_line.push_str(&format!(", {}", package_str));
+                current_line.push_str(&format!(", {package_str}"));
             } else {
-                println!("{}", current_line);
-                current_line = format!("  {}", package_str);
+                println!("{current_line}");
+                current_line = format!("  {package_str}");
             }
         }
 
         if !current_line.is_empty() {
-            println!("{}", current_line);
+            println!("{current_line}");
         }
 
         println!(
@@ -1633,6 +1636,7 @@ impl PackageManager {
     }
 
     /// Resolve version range to actual version by fetching from registry
+    #[allow(dead_code)]
     async fn resolve_version_range(
         &self,
         package_name: &str,
@@ -1673,7 +1677,7 @@ impl PackageManager {
             while let Some(entry) = entries.next_entry().await? {
                 if let Ok(metadata) = entry.metadata().await {
                     if metadata.is_file()
-                        && entry.path().extension().map_or(false, |ext| ext == "tgz")
+                        && entry.path().extension().is_some_and(|ext| ext == "tgz")
                     {
                         total_size += metadata.len();
                         package_count += 1;
@@ -1705,7 +1709,7 @@ impl PackageManager {
             let mut cleared_count = 0u32;
 
             while let Some(entry) = entries.next_entry().await? {
-                if entry.path().extension().map_or(false, |ext| ext == "tgz") {
+                if entry.path().extension().is_some_and(|ext| ext == "tgz") {
                     fs::remove_file(entry.path()).await?;
                     cleared_count += 1;
                 }
@@ -2048,7 +2052,7 @@ impl PackageManager {
             "{} Running script: {} {}",
             style("🚀").blue(),
             style(script_name).white().bold(),
-            style(&format!("({})", script_command)).dim()
+            style(&format!("({script_command})")).dim()
         );
 
         // Check if node_modules/.bin exists and list contents for debugging

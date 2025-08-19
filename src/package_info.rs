@@ -21,6 +21,7 @@ pub struct DistInfo {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NpmRegistryResponse {
+    #[allow(dead_code)]
     pub name: String,
     pub versions: HashMap<String, PackageInfo>,
     #[serde(rename = "dist-tags")]
