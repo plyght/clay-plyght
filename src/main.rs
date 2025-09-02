@@ -235,8 +235,7 @@ async fn main() -> Result<()> {
                 // Report any remaining conflicts
                 package_manager.report_peer_conflicts().await?;
             } else if !skip_peers {
-                // Default behavior: just report peer conflicts without auto-installing
-                package_manager.report_peer_conflicts().await?;
+                // Only check peers if explicitly requested, keep output clean like Bun by default
             }
         }
         Commands::Uninstall { packages } => {

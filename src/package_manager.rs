@@ -13,7 +13,6 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::cli_style::CliStyle;
-use crate::content_store::ContentStore;
 use crate::npm_client::NpmClient;
 use crate::package_info::{DistInfo, LockFile, NpmRegistryResponse, PackageInfo, PackageJson};
 
@@ -47,7 +46,18 @@ impl PackageResolver {
         version_spec: &str,
         is_dev: bool,
     ) -> Result<ResolvedPackage> {
-        self.resolve_package_iterative(name, version_spec, is_dev)
+        self.resolve_package_iterative(name, version_spec, is_dev, None)
+            .await
+    }
+
+    async fn resolve_package_with_spinner(
+        &mut self,
+        name: &str,
+        version_spec: &str,
+        is_dev: bool,
+        spinner: &indicatif::ProgressBar,
+    ) -> Result<ResolvedPackage> {
+        self.resolve_package_iterative(name, version_spec, is_dev, Some(spinner))
             .await
     }
 
@@ -56,9 +66,8 @@ impl PackageResolver {
         root_name: &str,
         root_version_spec: &str,
         root_is_dev: bool,
+        external_spinner: Option<&indicatif::ProgressBar>,
     ) -> Result<ResolvedPackage> {
-        use std::io::{self, Write};
-
         // Stack for iterative processing: (name, version_spec, is_dev, parent_path)
         let mut work_stack = vec![(
             root_name.to_string(),
@@ -68,6 +77,8 @@ impl PackageResolver {
         )];
         let mut resolved_packages: HashMap<String, ResolvedPackage> = HashMap::new();
         let mut dependency_graph: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Don't create any spinners in iterative resolution when external spinner is provided
 
         while let Some((name, version_spec, is_dev, _parent_path)) = work_stack.pop() {
             let package_key = format!("{name}@{version_spec}");
@@ -84,14 +95,10 @@ impl PackageResolver {
 
             self.resolution_stack.insert(package_key.clone());
 
-            // Show intermediate resolution status
-            print!(
-                "\r    {} Fetching info for {}...{}",
-                style("↓").blue(),
-                style(&name).white(),
-                " ".repeat(50)
-            );
-            io::stdout().flush().unwrap();
+            // Update spinner only if external spinner is provided
+            if let Some(spinner) = external_spinner {
+                spinner.set_message(format!("Fetching {name}..."));
+            }
 
             // Fetch package info
             if !self.resolved_cache.contains_key(&name) {
@@ -99,14 +106,6 @@ impl PackageResolver {
                 self.resolved_cache.insert(name.clone(), response);
             }
             let registry_response = self.resolved_cache.get(&name).unwrap();
-
-            print!(
-                "\r    {} Selecting version for {}...{}",
-                CliStyle::arrow(""),
-                style(&name).white(),
-                " ".repeat(50)
-            );
-            io::stdout().flush().unwrap();
 
             // Resolve version
             let package_info = if version_spec == "latest" {
@@ -127,19 +126,17 @@ impl PackageResolver {
 
             let package_info = package_info.clone();
 
-            // Show dependency resolution status if package has dependencies
-            if package_info.dependencies.is_some()
-                && !package_info.dependencies.as_ref().unwrap().is_empty()
-            {
-                let dep_count = package_info.dependencies.as_ref().unwrap().len();
-                print!(
-                    "\r    {} Processing {} dependencies for {}...{}",
-                    CliStyle::arrow(""),
-                    style(dep_count.to_string()).yellow(),
-                    style(&name).white(),
-                    " ".repeat(30)
-                );
-                io::stdout().flush().unwrap();
+            // Update spinner for dependency processing if external spinner is provided
+            if let Some(spinner) = external_spinner {
+                if let Some(ref deps) = package_info.dependencies {
+                    if !deps.is_empty() {
+                        spinner.set_message(format!(
+                            "Processing {} dependencies for {}...",
+                            deps.len(),
+                            name
+                        ));
+                    }
+                }
             }
 
             // Add dependencies to work stack
@@ -173,22 +170,15 @@ impl PackageResolver {
         }
 
         // Build dependency tree
-        print!(
-            "\r    {} Building dependency tree for {}...{}",
-            style("🌳").green(),
-            style(root_name).white(),
-            " ".repeat(50)
-        );
-        io::stdout().flush().unwrap();
+        if let Some(spinner) = external_spinner {
+            spinner.set_message(format!("Building dependency tree for {root_name}..."));
+        }
 
         let root_key = format!("{root_name}@{root_version_spec}");
-        let result = self.build_dependency_tree(&root_key, &resolved_packages, &dependency_graph);
+        
+        // Don't finish external spinners here
 
-        // Clear the building tree message completely
-        print!("\r{}\r", " ".repeat(100));
-        io::stdout().flush().unwrap();
-
-        result
+        self.build_dependency_tree(&root_key, &resolved_packages, &dependency_graph)
     }
 
     fn build_dependency_tree(
@@ -198,7 +188,7 @@ impl PackageResolver {
         dependency_graph: &HashMap<String, Vec<String>>,
     ) -> Result<ResolvedPackage> {
         let mut visited = HashSet::new();
-        self.build_tree_recursive(
+        Self::build_tree_recursive(
             package_key,
             resolved_packages,
             dependency_graph,
@@ -207,7 +197,6 @@ impl PackageResolver {
     }
 
     fn build_tree_recursive(
-        &self,
         package_key: &str,
         resolved_packages: &HashMap<String, ResolvedPackage>,
         dependency_graph: &HashMap<String, Vec<String>>,
@@ -248,7 +237,7 @@ impl PackageResolver {
             let mut dependencies = Vec::new();
             for dep_key in dep_keys {
                 if let Ok(dep) =
-                    self.build_tree_recursive(dep_key, resolved_packages, dependency_graph, visited)
+                    Self::build_tree_recursive(dep_key, resolved_packages, dependency_graph, visited)
                 {
                     dependencies.push(dep);
                 }
@@ -289,16 +278,37 @@ impl PackageResolver {
         &mut self,
         packages: Vec<(String, String, bool)>, // name, version, is_dev
     ) -> Result<Vec<ResolvedPackage>> {
+        if packages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let use_own_spinner = true;
+        self.resolve_multiple_packages_internal(packages, use_own_spinner, None)
+            .await
+    }
+
+    pub async fn resolve_multiple_packages_with_spinner(
+        &mut self,
+        packages: Vec<(String, String, bool)>, // name, version, is_dev
+        spinner: &indicatif::ProgressBar,
+    ) -> Result<Vec<ResolvedPackage>> {
+        self.resolve_multiple_packages_internal(packages, false, Some(spinner))
+            .await
+    }
+
+    async fn resolve_multiple_packages_internal(
+        &mut self,
+        packages: Vec<(String, String, bool)>, // name, version, is_dev
+        create_own_spinner: bool,
+        external_spinner: Option<&indicatif::ProgressBar>,
+    ) -> Result<Vec<ResolvedPackage>> {
         use futures::stream::{FuturesUnordered, StreamExt};
 
         if packages.is_empty() {
             return Ok(Vec::new());
         }
 
-        let parallel_spinner = CliStyle::create_spinner(&format!(
-            "Resolving {} packages in parallel...",
-            packages.len()
-        ));
+        // Don't create separate spinners when using external spinner
 
         // Create semaphore for concurrency control
         let semaphore = Arc::new(Semaphore::new(12)); // Allow up to 12 concurrent resolutions
@@ -344,21 +354,12 @@ impl PackageResolver {
         while let Some((package_name, result)) = futures.next().await {
             match result {
                 Ok(resolved_pkg) => {
-                    println!(
-                        "  {} Resolved {} ({})",
-                        CliStyle::success(""),
-                        style(&package_name).white(),
-                        style(&resolved_pkg.version).dim()
-                    );
+                    if let Some(spinner) = external_spinner {
+                        spinner.set_message(format!("resolved {package_name}..."));
+                    }
                     resolved.push(resolved_pkg);
                 }
                 Err(e) => {
-                    println!(
-                        "  {} Failed to resolve {}: {}",
-                        CliStyle::error(""),
-                        style(&package_name).white().bold(),
-                        style(e.to_string()).dim()
-                    );
                     failed_packages.push((package_name, e));
                 }
             }
@@ -370,23 +371,9 @@ impl PackageResolver {
             self.resolved_cache = cache.clone();
         }
 
-        // Show resolution summary
-        if !resolved.is_empty() {
-            let success_msg = if !failed_packages.is_empty() {
-                format!(
-                    "Resolved {} packages successfully ({} failed)",
-                    resolved.len(),
-                    failed_packages.len()
-                )
-            } else {
-                format!("Resolved {} packages successfully", resolved.len())
-            };
-            parallel_spinner.finish_with_message(success_msg);
-        } else {
-            parallel_spinner.finish_with_message("No packages resolved");
-        }
+        // Don't finish external spinners
 
-        if !failed_packages.is_empty() {
+        if !failed_packages.is_empty() && create_own_spinner {
             println!(
                 "{} {} packages failed to resolve",
                 CliStyle::warning(""),
@@ -491,7 +478,6 @@ pub struct PackageManager {
     file_mutex: Arc<Mutex<()>>,
     cache_dir: PathBuf,
     use_toml_lock: bool,
-    content_store: Arc<ContentStore>,
 }
 
 impl PackageManager {
@@ -508,8 +494,6 @@ impl PackageManager {
             PathBuf::from("clay-lock.json")
         };
 
-        let content_store = Arc::new(ContentStore::new());
-
         Self {
             npm_client: NpmClient::new(),
             node_modules_dir: PathBuf::from("node_modules"),
@@ -519,7 +503,6 @@ impl PackageManager {
             file_mutex: Arc::new(Mutex::new(())),
             cache_dir,
             use_toml_lock: use_toml,
-            content_store,
         }
     }
 
@@ -623,13 +606,18 @@ impl PackageManager {
             .map(|(name, version)| (name, version, is_dev))
             .collect();
 
+        // Single unified spinner for entire operation
+        let start_time = std::time::Instant::now();
+        let main_spinner = CliStyle::create_spinner("clay install");
+
         // Phase 1: Resolution
-        let resolution_spinner = CliStyle::create_spinner("Resolving dependencies...");
-        let resolved_packages = resolver.resolve_multiple_packages(package_specs).await?;
-        resolution_spinner.finish_with_message(CliStyle::success("Dependencies resolved"));
+        main_spinner.set_message("resolving dependencies...");
+        let resolved_packages = resolver
+            .resolve_multiple_packages_with_spinner(package_specs, &main_spinner)
+            .await?;
 
         if resolved_packages.is_empty() {
-            println!("{} No valid packages to install", style("•").yellow());
+            main_spinner.finish_with_message("No valid packages to install");
             return Ok(());
         }
 
@@ -660,16 +648,8 @@ impl PackageManager {
         }
 
         if to_install.is_empty() {
-            if is_specific_install {
-                println!(
-                    "{}",
-                    CliStyle::success("All packages and dependencies are already installed")
-                );
-            } else {
-                println!(
-                    "{}",
-                    CliStyle::success("All packages and dependencies are already installed")
-                );
+            main_spinner.finish_with_message("All packages already installed");
+            if !is_specific_install {
                 self.show_installed_packages_summary().await?;
             }
             return Ok(());
@@ -683,53 +663,42 @@ impl PackageManager {
                 .collect::<Vec<_>>(),
         );
 
-        let lock_format = if self.use_toml_lock { "TOML" } else { "JSON" };
-
-        println!(
-            "{} Installing {} packages (including {} dependencies) [{}]...",
-            CliStyle::info(""),
-            to_install.len(),
-            total_packages - to_install.len() as u64,
-            style(lock_format).dim()
-        );
-
-        // Phase 3: Install with progress tracking
-        let mut progress = ProgressTracker::new(total_packages);
+        // Phase 3: Install with same spinner
+        main_spinner.set_message("installing packages...");
 
         for resolved_pkg in &to_install {
-            self.install_resolved_package(resolved_pkg, true, &mut progress)
+            main_spinner.set_message(format!("installing {}...", resolved_pkg.name));
+            self.install_resolved_package_with_spinner(resolved_pkg, true, &main_spinner)
                 .await?;
         }
 
-        progress.finish();
+        // Create Bun-style final summary
+        let duration = start_time.elapsed();
+        let installed_packages: Vec<String> = to_install
+            .iter()
+            .map(|pkg| format!("{}@{}", pkg.name, pkg.version))
+            .collect();
 
-        // Show summary
-        if to_install.len() == 1 {
-            println!(
-                "\n{} Successfully installed {}",
-                CliStyle::success(""),
-                style(&to_install[0].name).white().bold()
-            );
+        let summary = if to_install.len() == 1 {
+            format!("installed {}", installed_packages[0])
         } else {
-            println!(
-                "\n{} Successfully installed {} packages",
-                CliStyle::success(""),
-                style(to_install.len()).white().bold()
-            );
-        }
+            format!("installed {}", installed_packages.join(", "))
+        };
 
-        // Show lock file format used
-        let lock_format = if self.use_toml_lock { "TOML" } else { "JSON" };
-        println!(
-            "{} Lock file updated ({})",
-            style("📄").blue(),
-            style(lock_format).dim()
+        let timing = format!(
+            "{} packages installed [{}]",
+            total_packages,
+            CliStyle::format_duration(duration)
         );
 
-        // Show summary of all installed packages only for package.json installs
-        if !is_specific_install {
-            self.show_installed_packages_summary().await?;
-        }
+        main_spinner.finish_and_clear();
+
+        // Print final summary like Bun with proper spacing
+        println!("clay install v0.1.1");
+        println!();
+        println!("{summary}");
+        println!();
+        println!("{timing}");
 
         Ok(())
     }
@@ -776,7 +745,39 @@ impl PackageManager {
         Ok(count)
     }
 
-    /// Install a resolved package with its dependencies
+    /// Install a resolved package with its dependencies (using spinner)
+    async fn install_resolved_package_with_spinner(
+        &self,
+        resolved_pkg: &ResolvedPackage,
+        update_package_json: bool,
+        spinner: &indicatif::ProgressBar,
+    ) -> Result<()> {
+        // Check if already installed
+        let package_dir = self.node_modules_dir.join(&resolved_pkg.name);
+        if package_dir.exists() {
+            return Ok(());
+        }
+
+        // Install dependencies first
+        for dep in &resolved_pkg.dependencies {
+            spinner.set_message(format!("Installing {}...", dep.name));
+            Box::pin(self.install_resolved_package_with_spinner(dep, false, spinner)).await?;
+        }
+
+        // Install this package
+        spinner.set_message(format!("Installing {}...", resolved_pkg.name));
+        self.install_single_package_with_spinner(
+            &resolved_pkg.info,
+            update_package_json,
+            resolved_pkg.is_dev,
+            spinner,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Install a resolved package with its dependencies (legacy progress bar)
     async fn install_resolved_package(
         &self,
         resolved_pkg: &ResolvedPackage,
@@ -786,11 +787,7 @@ impl PackageManager {
         // Check if already installed
         let package_dir = self.node_modules_dir.join(&resolved_pkg.name);
         if package_dir.exists() {
-            progress.update(&format!(
-                "{} {} (cached)",
-                style("•").cyan(),
-                resolved_pkg.name
-            ));
+            progress.update(&format!("{} (cached)", resolved_pkg.name));
             return Ok(());
         }
 
@@ -811,7 +808,84 @@ impl PackageManager {
         Ok(())
     }
 
-    /// Install a single package without dependency resolution
+    /// Install a single package without dependency resolution (using spinner)
+    async fn install_single_package_with_spinner(
+        &self,
+        package_info: &PackageInfo,
+        update_package_json: bool,
+        is_dev: bool,
+        spinner: &indicatif::ProgressBar,
+    ) -> Result<()> {
+        // Skip circular dependency stubs
+        if package_info.name == "circular" {
+            return Ok(());
+        }
+
+        // Ensure node_modules directory exists
+        self.ensure_node_modules_exists().await?;
+
+        // Check if package is already installed
+        let package_dir = self.node_modules_dir.join(&package_info.name);
+        if package_dir.exists() {
+            return Ok(());
+        }
+
+        // Download the package tarball
+        spinner.set_message(format!("Downloading {}...", package_info.name));
+        let tarball_path = self.download_package_tarball(package_info).await?;
+
+        // Check if tarball was actually created
+        if !tarball_path.exists() {
+            return Err(anyhow!(
+                "Failed to download tarball for {}",
+                package_info.name
+            ));
+        }
+
+        // Extract the tarball to node_modules
+        spinner.set_message(format!("Extracting {}...", package_info.name));
+        self.extract_package(&tarball_path, &package_dir).await?;
+
+        // Setup bin commands for this package
+        self.setup_bin_commands(&package_info.name, &package_dir)
+            .await?;
+
+        // Clean up the tarball and temp directory
+        if tarball_path.exists() {
+            fs::remove_file(&tarball_path).await.ok();
+        }
+        if let Some(temp_dir) = tarball_path.parent() {
+            fs::remove_dir_all(temp_dir).await.ok();
+        }
+
+        // Update package.json only if this is the explicitly requested package
+        if update_package_json {
+            self.update_package_json(&package_info.name, &package_info.version, is_dev)
+                .await?;
+        }
+
+        // Update lock file
+        let parent_name = if update_package_json {
+            "root"
+        } else {
+            // For dependency packages, use the package name as parent
+            &package_info.name
+        };
+
+        self.update_lock_file(
+            &package_info.name,
+            &package_info.version,
+            &package_info.dist.tarball,
+            &package_info.dist.shasum,
+            package_info.dependencies.as_ref(),
+            parent_name,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Install a single package without dependency resolution (legacy progress bar)
     async fn install_single_package(
         &self,
         package_info: &PackageInfo,
@@ -834,7 +908,7 @@ impl PackageManager {
         }
 
         // Download the package tarball
-        progress.update(&format!("{} {}", style("↓").cyan(), package_info.name));
+        progress.update(&format!("Downloading {}", package_info.name));
         let tarball_path = self.download_package_tarball(package_info).await?;
 
         // Check if tarball was actually created
@@ -846,7 +920,7 @@ impl PackageManager {
         }
 
         // Extract the tarball to node_modules
-        progress.update(&format!("{} {}", CliStyle::arrow(""), package_info.name));
+        progress.update(&format!("Extracting {}", package_info.name));
         self.extract_package(&tarball_path, &package_dir).await?;
 
         // Setup bin commands for this package
@@ -886,7 +960,7 @@ impl PackageManager {
         .await?;
 
         // Update progress for main package
-        progress.update(&format!("{} {}", CliStyle::success(""), package_info.name));
+        progress.update(&format!("Installed {}", package_info.name));
 
         // Install dependencies in parallel if any
         if let Some(ref dependencies) = package_info.dependencies {
@@ -1081,7 +1155,7 @@ impl PackageManager {
         for task in tasks {
             match task.await? {
                 Ok((dep_name, deps)) => {
-                    progress.update(&format!("{} {}", CliStyle::success(""), dep_name));
+                    progress.update(&format!("Installed {dep_name}"));
                     if let Some(deps) = deps {
                         nested_dependencies.push((dep_name, deps));
                     }
@@ -1278,11 +1352,7 @@ impl PackageManager {
         }
 
         // Update progress
-        progress.update(&format!(
-            "{} Removed {}",
-            CliStyle::success(""),
-            package_name
-        ));
+        progress.update(&format!("Removed {package_name}"));
         progress.finish();
 
         // Show summary

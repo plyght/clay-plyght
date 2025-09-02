@@ -501,8 +501,7 @@ impl WorkspaceManager {
             "workspaces"
         };
         let install_spinner = CliStyle::create_spinner(&format!(
-            "Installing dependencies for {} {}...",
-            workspace_count, workspace_word
+            "Installing dependencies for {workspace_count} {workspace_word}..."
         ));
 
         // Install root dependencies first
@@ -525,8 +524,7 @@ impl WorkspaceManager {
         }
 
         install_spinner.finish_with_message(format!(
-            "Installed dependencies for {} {}",
-            workspace_count, workspace_word
+            "Installed dependencies for {workspace_count} {workspace_word}"
         ));
         Ok(())
     }

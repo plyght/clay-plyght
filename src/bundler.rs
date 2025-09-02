@@ -20,8 +20,6 @@ pub struct Bundler {
 struct ModuleInfo {
     content: String,
     dependencies: Vec<String>,
-    exports: Vec<String>,
-    is_entry: bool,
 }
 
 impl Bundler {
@@ -77,7 +75,6 @@ impl Bundler {
                 entry_point,
                 &mut bundle_content,
                 &mut bundled_modules,
-                true,
             )
             .await?;
         }
@@ -207,7 +204,6 @@ impl Bundler {
         module_path: &Path,
         bundle: &mut String,
         bundled: &mut HashSet<PathBuf>,
-        is_entry: bool,
     ) -> Result<()> {
         let canonical_path = fs::canonicalize(module_path)
             .await
@@ -217,13 +213,13 @@ impl Bundler {
             return Ok(());
         }
 
-        let module_info = self.analyze_module(module_path, is_entry).await?;
+        let module_info = self.analyze_module(module_path).await?;
         bundled.insert(canonical_path.clone());
 
         // Bundle dependencies first
         for dep in &module_info.dependencies {
             if let Ok(dep_path) = self.resolve_module_path(dep, module_path).await {
-                Box::pin(self.resolve_and_bundle_module(&dep_path, bundle, bundled, false)).await?;
+                Box::pin(self.resolve_and_bundle_module(&dep_path, bundle, bundled)).await?;
             }
         }
 
@@ -235,7 +231,7 @@ impl Bundler {
         Ok(())
     }
 
-    async fn analyze_module(&mut self, module_path: &Path, is_entry: bool) -> Result<ModuleInfo> {
+    async fn analyze_module(&mut self, module_path: &Path) -> Result<ModuleInfo> {
         if let Some(cached) = self.module_cache.get(module_path) {
             return Ok(cached.clone());
         }
@@ -244,13 +240,10 @@ impl Bundler {
         let transformed_content = self.transform_module(&content, module_path).await?;
 
         let dependencies = self.extract_dependencies(&content)?;
-        let exports = self.extract_exports(&content)?;
 
         let module_info = ModuleInfo {
             content: transformed_content,
             dependencies,
-            exports,
-            is_entry,
         };
 
         self.module_cache
@@ -365,20 +358,6 @@ impl Bundler {
         Ok(dependencies)
     }
 
-    fn extract_exports(&self, content: &str) -> Result<Vec<String>> {
-        let mut exports = Vec::new();
-
-        let export_regex =
-            regex::Regex::new(r"export\s+(?:default\s+)?(?:const|let|var|function|class)\s+(\w+)")?;
-
-        for cap in export_regex.captures_iter(content) {
-            if let Some(export_name) = cap.get(1) {
-                exports.push(export_name.as_str().to_string());
-            }
-        }
-
-        Ok(exports)
-    }
 
     async fn resolve_module_path(
         &mut self,
