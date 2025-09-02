@@ -90,9 +90,8 @@ impl DevServer {
         self.host = host.to_string();
         self.port = port;
 
-        let server_spinner = CliStyle::create_spinner(&format!(
-            "Starting development server on {host}:{port}..."
-        ));
+        let server_spinner =
+            CliStyle::create_spinner(&format!("Starting development server on {host}:{port}..."));
 
         // Initial bundle
         server_spinner.set_message("Building initial bundle...");

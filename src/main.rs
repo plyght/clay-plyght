@@ -182,6 +182,7 @@ async fn main() -> Result<()> {
             skip_peers,
         } => {
             let package_manager = PackageManager::with_toml_lock(!json);
+            package_manager.initialize().await?;
 
             let package_specs = if packages.is_empty() {
                 package_manager.get_package_json_dependencies(dev).await?
@@ -240,12 +241,14 @@ async fn main() -> Result<()> {
         }
         Commands::Uninstall { packages } => {
             let package_manager = PackageManager::new();
+            package_manager.initialize().await?;
             for package_name in packages {
                 package_manager.uninstall_package(&package_name).await?;
             }
         }
         Commands::List => {
             let package_manager = PackageManager::new();
+            package_manager.initialize().await?;
             package_manager.list_installed_packages().await?;
         }
         Commands::Upgrade { yes } => {
@@ -253,6 +256,7 @@ async fn main() -> Result<()> {
         }
         Commands::Run { script } => {
             let package_manager = PackageManager::new();
+            package_manager.initialize().await?;
             match script {
                 Some(script_name) => {
                     package_manager.run_script(&script_name).await?;
@@ -264,6 +268,7 @@ async fn main() -> Result<()> {
         }
         Commands::Cache(cache_cmd) => {
             let package_manager = PackageManager::new();
+            package_manager.initialize().await?;
             match cache_cmd {
                 CacheCommands::Info => {
                     package_manager.cache_info().await?;
@@ -311,6 +316,7 @@ async fn main() -> Result<()> {
                 StoreCommands::Cleanup => {
                     // Get list of currently installed packages
                     let package_manager = PackageManager::new();
+                    package_manager.initialize().await?;
                     let active_packages = package_manager
                         .get_installed_packages()
                         .await
@@ -324,6 +330,7 @@ async fn main() -> Result<()> {
                 StoreCommands::Gc => {
                     content_store.deduplicate_store().await?;
                     let package_manager = PackageManager::new();
+                    package_manager.initialize().await?;
                     let active_packages = package_manager
                         .get_installed_packages()
                         .await
@@ -380,6 +387,7 @@ async fn main() -> Result<()> {
         }
         Commands::Peer(peer_cmd) => {
             let package_manager = PackageManager::new();
+            package_manager.initialize().await?;
             match peer_cmd {
                 PeerCommands::Check => {
                     package_manager.report_peer_conflicts().await?;
@@ -426,6 +434,7 @@ async fn main() -> Result<()> {
         }
         Commands::Check { peers, all } => {
             let package_manager = PackageManager::new();
+            package_manager.initialize().await?;
 
             if peers || all {
                 println!("{}", CliStyle::info("Checking peer dependencies..."));
@@ -482,6 +491,7 @@ async fn main() -> Result<()> {
                 // Show general package manager info
                 let stats = content_store.get_store_stats().await?;
                 let package_manager = PackageManager::new();
+                package_manager.initialize().await?;
                 package_manager.cache_info().await?;
                 println!("\n{}", CliStyle::section_header("Content Store:"));
                 println!(

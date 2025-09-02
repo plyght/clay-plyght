@@ -2,6 +2,7 @@ use anyhow::Result;
 use console::style;
 
 use crate::cli_style::CliStyle;
+use crate::package_info::DependencyTree;
 use dashmap::DashMap;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,7 @@ pub struct ContentStore {
     store_path: PathBuf,
     index: Arc<DashMap<String, ContentAddress>>,
     package_index: Arc<DashMap<String, PackageMetadata>>,
+    tree_index: Arc<DashMap<String, DependencyTree>>,
 }
 
 impl ContentStore {
@@ -42,6 +44,7 @@ impl ContentStore {
             store_path,
             index: Arc::new(DashMap::new()),
             package_index: Arc::new(DashMap::new()),
+            tree_index: Arc::new(DashMap::new()),
         }
     }
 
@@ -160,6 +163,57 @@ impl ContentStore {
         self.package_index
             .get(&package_key)
             .map(|entry| entry.clone())
+    }
+
+    /// Store a dependency tree in the content store
+    pub async fn store_dependency_tree(&self, tree: DependencyTree) -> Result<String> {
+        let tree_hash = tree.tree_hash.clone();
+
+        // Store in memory index
+        self.tree_index.insert(tree_hash.clone(), tree.clone());
+
+        // Persist to disk
+        let tree_path = self.get_tree_path(&tree_hash);
+        if let Some(parent) = tree_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        let tree_json = serde_json::to_string_pretty(&tree)?;
+        fs::write(&tree_path, tree_json).await?;
+
+        println!(
+            "{} Stored dependency tree ({})",
+            CliStyle::success(""),
+            style(&tree_hash[..8]).dim()
+        );
+
+        Ok(tree_hash)
+    }
+
+    /// Get a dependency tree from the content store
+    pub async fn get_dependency_tree(&self, tree_hash: &str) -> Option<DependencyTree> {
+        // Check in-memory index first
+        if let Some(tree) = self.tree_index.get(tree_hash) {
+            return Some(tree.clone());
+        }
+
+        // Try loading from disk
+        let tree_path = self.get_tree_path(tree_hash);
+        if tree_path.exists() {
+            if let Ok(content) = fs::read_to_string(&tree_path).await {
+                if let Ok(tree) = serde_json::from_str::<DependencyTree>(&content) {
+                    self.tree_index.insert(tree_hash.to_string(), tree.clone());
+                    return Some(tree);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if a dependency tree exists in the store
+    pub async fn has_dependency_tree(&self, tree_hash: &str) -> bool {
+        self.tree_index.contains_key(tree_hash) || self.get_tree_path(tree_hash).exists()
     }
 
     pub async fn deduplicate_store(&self) -> Result<u64> {
@@ -343,6 +397,7 @@ impl ContentStore {
         fs::create_dir_all(&self.store_path).await?;
         fs::create_dir_all(self.store_path.join("content")).await?;
         fs::create_dir_all(self.store_path.join("index")).await?;
+        fs::create_dir_all(self.store_path.join("trees")).await?;
         Ok(())
     }
 
@@ -354,6 +409,16 @@ impl ContentStore {
             .join("content")
             .join(dir)
             .join(format!("{file}.tar.gz"))
+    }
+
+    fn get_tree_path(&self, tree_hash: &str) -> PathBuf {
+        // Use first 2 chars for directory sharding
+        let dir = &tree_hash[..2];
+        let file = &tree_hash[2..];
+        self.store_path
+            .join("trees")
+            .join(dir)
+            .join(format!("{file}.json"))
     }
 
     fn calculate_content_hash(&self, data: &[u8]) -> String {

@@ -71,12 +71,8 @@ impl Bundler {
 
         for entry_point in &self.entry_points.clone() {
             bundle_spinner.set_message(format!("Processing {}", entry_point.display()));
-            self.resolve_and_bundle_module(
-                entry_point,
-                &mut bundle_content,
-                &mut bundled_modules,
-            )
-            .await?;
+            self.resolve_and_bundle_module(entry_point, &mut bundle_content, &mut bundled_modules)
+                .await?;
         }
 
         // Apply transformations
@@ -357,7 +353,6 @@ impl Bundler {
 
         Ok(dependencies)
     }
-
 
     async fn resolve_module_path(
         &mut self,

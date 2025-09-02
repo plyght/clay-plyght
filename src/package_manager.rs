@@ -13,8 +13,11 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::cli_style::CliStyle;
+use crate::content_store::ContentStore;
 use crate::npm_client::NpmClient;
-use crate::package_info::{DistInfo, LockFile, NpmRegistryResponse, PackageInfo, PackageJson};
+use crate::package_info::{
+    DependencyTree, DistInfo, LockFile, LockMode, NpmRegistryResponse, PackageInfo, PackageJson,
+};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedPackage {
@@ -175,7 +178,7 @@ impl PackageResolver {
         }
 
         let root_key = format!("{root_name}@{root_version_spec}");
-        
+
         // Don't finish external spinners here
 
         self.build_dependency_tree(&root_key, &resolved_packages, &dependency_graph)
@@ -236,9 +239,12 @@ impl PackageResolver {
         if let Some(dep_keys) = dependency_graph.get(package_key) {
             let mut dependencies = Vec::new();
             for dep_key in dep_keys {
-                if let Ok(dep) =
-                    Self::build_tree_recursive(dep_key, resolved_packages, dependency_graph, visited)
-                {
+                if let Ok(dep) = Self::build_tree_recursive(
+                    dep_key,
+                    resolved_packages,
+                    dependency_graph,
+                    visited,
+                ) {
                     dependencies.push(dep);
                 }
             }
@@ -471,6 +477,7 @@ impl ProgressTracker {
 
 pub struct PackageManager {
     pub npm_client: NpmClient,
+    content_store: ContentStore,
     node_modules_dir: PathBuf,
     package_json_path: PathBuf,
     lock_file_path: PathBuf,
@@ -478,6 +485,7 @@ pub struct PackageManager {
     file_mutex: Arc<Mutex<()>>,
     cache_dir: PathBuf,
     use_toml_lock: bool,
+    lock_mode: LockMode,
 }
 
 impl PackageManager {
@@ -494,8 +502,11 @@ impl PackageManager {
             PathBuf::from("clay-lock.json")
         };
 
+        let lock_mode = Self::detect_lock_mode();
+
         Self {
             npm_client: NpmClient::new(),
+            content_store: ContentStore::new(),
             node_modules_dir: PathBuf::from("node_modules"),
             package_json_path: PathBuf::from("package.json"),
             lock_file_path,
@@ -503,6 +514,7 @@ impl PackageManager {
             file_mutex: Arc::new(Mutex::new(())),
             cache_dir,
             use_toml_lock: use_toml,
+            lock_mode,
         }
     }
 
@@ -512,6 +524,178 @@ impl PackageManager {
         } else {
             PathBuf::from(".clay-cache")
         }
+    }
+
+    /// Auto-detect lock mode based on environment and project state
+    fn detect_lock_mode() -> LockMode {
+        // Check for CI environment - use explicit lockfiles in CI
+        if std::env::var("CI").is_ok() {
+            return LockMode::Explicit;
+        }
+
+        // Check for existing lockfiles - use hybrid mode for backward compatibility
+        if PathBuf::from("clay-lock.toml").exists() || PathBuf::from("clay-lock.json").exists() {
+            return LockMode::Hybrid;
+        }
+
+        // Default to implicit (content-addressable) mode
+        LockMode::Implicit
+    }
+
+    /// Initialize content store
+    pub async fn initialize(&self) -> Result<()> {
+        self.content_store.initialize().await?;
+        Ok(())
+    }
+
+    /// Load package.json from the project
+    async fn load_package_json(&self) -> Result<PackageJson> {
+        if !self.package_json_path.exists() {
+            return Ok(PackageJson::new());
+        }
+
+        let content = fs::read_to_string(&self.package_json_path).await?;
+        let package_json: PackageJson = if content.trim().is_empty() {
+            PackageJson::new()
+        } else {
+            serde_json::from_str(&content).unwrap_or_else(|_| PackageJson::new())
+        };
+
+        Ok(package_json)
+    }
+
+    /// Check if a package is installed
+    async fn is_package_installed(&self, package_name: &str, version: &str) -> Result<bool> {
+        let package_dir = self.node_modules_dir.join(package_name);
+        if !package_dir.exists() {
+            return Ok(false);
+        }
+
+        // Check if version matches (optional, for now just check existence)
+        let package_json_path = package_dir.join("package.json");
+        if package_json_path.exists() {
+            if let Ok(content) = fs::read_to_string(&package_json_path).await {
+                if let Ok(package_json) = serde_json::from_str::<PackageJson>(&content) {
+                    if let Some(installed_version) = package_json.version {
+                        return Ok(installed_version == version);
+                    }
+                }
+            }
+        }
+
+        // Fallback: just check directory existence
+        Ok(package_dir.exists())
+    }
+
+    /// Check if we can use cached dependency tree from content store
+    async fn check_cached_dependency_tree(
+        &self,
+        is_dev_install: bool,
+    ) -> Result<Option<DependencyTree>> {
+        // Only check cache for implicit/hybrid modes
+        if matches!(self.lock_mode, LockMode::Memory | LockMode::Explicit) {
+            return Ok(None);
+        }
+
+        let package_json = self.load_package_json().await?;
+        let dependency_fingerprint = package_json.calculate_dependency_fingerprint(is_dev_install);
+
+        if let Some(tree) = self
+            .content_store
+            .get_dependency_tree(&dependency_fingerprint)
+            .await
+        {
+            println!(
+                "{} Using cached dependency tree ({})",
+                CliStyle::info(""),
+                style(&dependency_fingerprint[..8]).dim()
+            );
+            return Ok(Some(tree));
+        }
+
+        Ok(None)
+    }
+
+    /// Store dependency tree in content store using dependency fingerprint as key
+    async fn store_dependency_tree(
+        &self,
+        tree: DependencyTree,
+        dependency_fingerprint: &str,
+    ) -> Result<()> {
+        // Only store for implicit/hybrid modes
+        if matches!(self.lock_mode, LockMode::Memory) {
+            return Ok(());
+        }
+
+        // Store tree using dependency fingerprint as the key (not the tree's internal hash)
+        let mut modified_tree = tree;
+        modified_tree.tree_hash = dependency_fingerprint.to_string();
+
+        self.content_store
+            .store_dependency_tree(modified_tree)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Create dependency tree from resolved packages
+    fn create_dependency_tree(&self, resolved_packages: &[ResolvedPackage]) -> DependencyTree {
+        let mut tree = DependencyTree::new();
+
+        for package in resolved_packages {
+            let content_hash = format!("sha1:{}", package.info.dist.shasum);
+            tree.add_package(
+                &package.name,
+                &package.version,
+                &content_hash,
+                &package.info.dist.shasum,
+                package.info.dependencies.clone(),
+            );
+        }
+
+        tree
+    }
+
+    /// Install packages from a cached dependency tree
+    async fn install_from_dependency_tree(
+        &self,
+        tree: &DependencyTree,
+        _is_dev: bool,
+    ) -> Result<()> {
+        let packages_to_install: Vec<_> = tree.packages.iter().collect();
+
+        if packages_to_install.is_empty() {
+            return Ok(());
+        }
+
+        let main_spinner = CliStyle::create_spinner("Installing from cached tree");
+
+        // Try to install packages directly from content store
+        for (package_name, resolved_package) in &packages_to_install {
+            if !self
+                .is_package_installed(package_name, &resolved_package.version)
+                .await?
+            {
+                // Try to link from content store first
+                let target_path = self.node_modules_dir.join(package_name);
+
+                if !self
+                    .content_store
+                    .link_package(package_name, &resolved_package.version, &target_path)
+                    .await?
+                {
+                    // Package not in content store, we need to resolve and download
+                    main_spinner.finish_and_clear();
+                    return Err(anyhow!(
+                        "Package {} not found in content store",
+                        package_name
+                    ));
+                }
+            }
+        }
+
+        main_spinner.finish_with_message("Installed from cached dependency tree");
+        Ok(())
     }
 
     async fn ensure_cache_dir_exists(&self) -> Result<()> {
@@ -598,6 +782,21 @@ impl PackageManager {
                 self.show_installed_packages_summary().await?;
             }
             return Ok(());
+        }
+
+        // Check for cached dependency tree (content-addressable approach)
+        if let Some(cached_tree) = self.check_cached_dependency_tree(is_dev).await? {
+            // We have a cached tree, try to install from it
+            if self
+                .install_from_dependency_tree(&cached_tree, is_dev)
+                .await
+                .is_ok()
+            {
+                if !is_specific_install {
+                    self.show_installed_packages_summary().await?;
+                }
+                return Ok(());
+            }
         }
 
         let mut resolver = PackageResolver::new(self.npm_client.clone());
@@ -692,6 +891,17 @@ impl PackageManager {
         );
 
         main_spinner.finish_and_clear();
+
+        // Store dependency tree in content store (content-addressable approach)
+        let dependency_tree = self.create_dependency_tree(&resolved_packages);
+        let package_json = self.load_package_json().await?;
+        let dependency_fingerprint = package_json.calculate_dependency_fingerprint(is_dev);
+        if let Err(e) = self
+            .store_dependency_tree(dependency_tree, &dependency_fingerprint)
+            .await
+        {
+            eprintln!("Warning: Failed to store dependency tree: {e}");
+        }
 
         // Print final summary like Bun with proper spacing
         println!("clay install v0.1.1");

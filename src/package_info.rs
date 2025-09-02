@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -95,6 +96,117 @@ impl PackageJson {
             deps.insert(name.to_string(), version.to_string());
             self.dev_dependencies = Some(deps);
         }
+    }
+
+    /// Calculate a deterministic fingerprint from dependencies
+    pub fn calculate_dependency_fingerprint(&self, include_dev: bool) -> String {
+        use sha1::{Digest, Sha1};
+
+        let mut hasher = Sha1::new();
+
+        // Hash regular dependencies
+        if let Some(ref deps) = self.dependencies {
+            let mut sorted: Vec<_> = deps.iter().collect();
+            sorted.sort_by_key(|(name, _)| *name);
+            for (name, version) in sorted {
+                hasher.update(format!("dep:{name}:{version}").as_bytes());
+            }
+        }
+
+        // Hash dev dependencies if requested
+        if include_dev {
+            if let Some(ref deps) = self.dev_dependencies {
+                let mut sorted: Vec<_> = deps.iter().collect();
+                sorted.sort_by_key(|(name, _)| *name);
+                for (name, version) in sorted {
+                    hasher.update(format!("dev:{name}:{version}").as_bytes());
+                }
+            }
+        }
+
+        // Hash peer dependencies (they affect resolution)
+        if let Some(ref deps) = self.peer_dependencies {
+            let mut sorted: Vec<_> = deps.iter().collect();
+            sorted.sort_by_key(|(name, _)| *name);
+            for (name, version) in sorted {
+                hasher.update(format!("peer:{name}:{version}").as_bytes());
+            }
+        }
+
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum LockMode {
+    #[default]
+    Implicit, // Content store only (default)
+    Explicit, // Traditional lockfiles
+    Hybrid,   // Both (CI gets lockfiles, dev doesn't)
+    Memory,   // Pure in-memory (no persistence)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependencyTree {
+    pub resolved_at: DateTime<Utc>,
+    pub packages: HashMap<String, ResolvedPackage>,
+    pub tree_hash: String, // Hash of the entire resolved tree
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedPackage {
+    pub version: String,
+    pub content_hash: String, // Hash from content store
+    pub integrity: String,    // NPM integrity hash
+    pub dependencies: Option<HashMap<String, String>>,
+}
+
+impl DependencyTree {
+    pub fn new() -> Self {
+        Self {
+            resolved_at: Utc::now(),
+            packages: HashMap::new(),
+            tree_hash: String::new(),
+        }
+    }
+
+    pub fn calculate_tree_hash(&mut self) {
+        use sha1::{Digest, Sha1};
+
+        let mut hasher = Sha1::new();
+
+        // Create a sorted representation for consistent hashing
+        let mut sorted_packages: Vec<_> = self.packages.iter().collect();
+        sorted_packages.sort_by_key(|(name, _)| *name);
+
+        for (name, package) in sorted_packages {
+            hasher.update(name.as_bytes());
+            hasher.update(package.version.as_bytes());
+            hasher.update(package.content_hash.as_bytes());
+            hasher.update(package.integrity.as_bytes());
+        }
+
+        self.tree_hash = format!("{:x}", hasher.finalize());
+    }
+
+    pub fn add_package(
+        &mut self,
+        name: &str,
+        version: &str,
+        content_hash: &str,
+        integrity: &str,
+        dependencies: Option<HashMap<String, String>>,
+    ) {
+        self.packages.insert(
+            name.to_string(),
+            ResolvedPackage {
+                version: version.to_string(),
+                content_hash: content_hash.to_string(),
+                integrity: integrity.to_string(),
+                dependencies,
+            },
+        );
+        self.calculate_tree_hash();
     }
 }
 
