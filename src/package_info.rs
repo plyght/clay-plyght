@@ -10,6 +10,10 @@ pub struct PackageInfo {
     pub main: Option<String>,
     pub bin: Option<Value>,
     pub dependencies: Option<HashMap<String, String>>,
+    #[serde(rename = "peerDependencies")]
+    pub peer_dependencies: Option<HashMap<String, String>>,
+    #[serde(rename = "optionalDependencies")]
+    pub optional_dependencies: Option<HashMap<String, String>>,
     pub dist: DistInfo,
 }
 
@@ -53,6 +57,10 @@ pub struct PackageJson {
     pub dependencies: Option<HashMap<String, String>>,
     #[serde(rename = "devDependencies")]
     pub dev_dependencies: Option<HashMap<String, String>>,
+    #[serde(rename = "peerDependencies")]
+    pub peer_dependencies: Option<HashMap<String, String>>,
+    #[serde(rename = "optionalDependencies")]
+    pub optional_dependencies: Option<HashMap<String, String>>,
 }
 
 impl PackageJson {
@@ -65,6 +73,8 @@ impl PackageJson {
             bin: None,
             dependencies: Some(HashMap::new()),
             dev_dependencies: Some(HashMap::new()),
+            peer_dependencies: Some(HashMap::new()),
+            optional_dependencies: Some(HashMap::new()),
         }
     }
 

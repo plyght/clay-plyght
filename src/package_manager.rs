@@ -12,6 +12,8 @@ use tokio::fs;
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
 
+use crate::cli_style::CliStyle;
+use crate::content_store::ContentStore;
 use crate::npm_client::NpmClient;
 use crate::package_info::{DistInfo, LockFile, NpmRegistryResponse, PackageInfo, PackageJson};
 
@@ -68,7 +70,7 @@ impl PackageResolver {
         let mut dependency_graph: HashMap<String, Vec<String>> = HashMap::new();
 
         while let Some((name, version_spec, is_dev, _parent_path)) = work_stack.pop() {
-            let package_key = format!("{}@{}", name, version_spec);
+            let package_key = format!("{name}@{version_spec}");
 
             // Check for circular dependency
             if self.resolution_stack.contains(&package_key) {
@@ -100,7 +102,7 @@ impl PackageResolver {
 
             print!(
                 "\r    {} Selecting version for {}...{}",
-                style("🔍").yellow(),
+                CliStyle::arrow(""),
                 style(&name).white(),
                 " ".repeat(50)
             );
@@ -132,7 +134,7 @@ impl PackageResolver {
                 let dep_count = package_info.dependencies.as_ref().unwrap().len();
                 print!(
                     "\r    {} Processing {} dependencies for {}...{}",
-                    style("⚡").magenta(),
+                    CliStyle::arrow(""),
                     style(dep_count.to_string()).yellow(),
                     style(&name).white(),
                     " ".repeat(30)
@@ -144,7 +146,7 @@ impl PackageResolver {
             let mut dep_keys = Vec::new();
             if let Some(ref deps) = package_info.dependencies {
                 for (dep_name, dep_version) in deps {
-                    let dep_key = format!("{}@{}", dep_name, dep_version);
+                    let dep_key = format!("{dep_name}@{dep_version}");
                     dep_keys.push(dep_key.clone());
                     work_stack.push((
                         dep_name.clone(),
@@ -179,7 +181,7 @@ impl PackageResolver {
         );
         io::stdout().flush().unwrap();
 
-        let root_key = format!("{}@{}", root_name, root_version_spec);
+        let root_key = format!("{root_name}@{root_version_spec}");
         let result = self.build_dependency_tree(&root_key, &resolved_packages, &dependency_graph);
 
         // Clear the building tree message completely
@@ -227,6 +229,8 @@ impl PackageResolver {
                         shasum: String::new(),
                     },
                     dependencies: None,
+                    peer_dependencies: None,
+                    optional_dependencies: None,
                 },
                 dependencies: Vec::new(),
                 is_dev: false,
@@ -285,51 +289,108 @@ impl PackageResolver {
         &mut self,
         packages: Vec<(String, String, bool)>, // name, version, is_dev
     ) -> Result<Vec<ResolvedPackage>> {
-        let mut resolved = Vec::new();
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        if packages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let parallel_spinner = CliStyle::create_spinner(&format!(
+            "Resolving {} packages in parallel...",
+            packages.len()
+        ));
+
+        // Create semaphore for concurrency control
+        let semaphore = Arc::new(Semaphore::new(12)); // Allow up to 12 concurrent resolutions
+        let npm_client = self.npm_client.clone();
+        let resolved_cache = Arc::new(Mutex::new(std::mem::take(&mut self.resolved_cache)));
+
+        // Create futures for parallel resolution
+        let mut futures = FuturesUnordered::new();
 
         for (name, version, is_dev) in packages {
-            print!(
-                "\r  {} Resolving {}...{}",
-                style("→").cyan(),
-                style(&name).white(),
-                " ".repeat(50)
-            );
-            use std::io::{self, Write};
-            io::stdout().flush().unwrap();
+            let semaphore = Arc::clone(&semaphore);
+            let npm_client = npm_client.clone();
+            let resolved_cache = Arc::clone(&resolved_cache);
 
-            match self.resolve_package(&name, &version, is_dev).await {
+            let future = async move {
+                let _permit = semaphore.acquire().await.unwrap();
+
+                // Create a temporary resolver for this package
+                let mut temp_resolver = PackageResolver::new(npm_client);
+                {
+                    let cache = resolved_cache.lock().await;
+                    temp_resolver.resolved_cache = cache.clone();
+                }
+
+                let result = temp_resolver.resolve_package(&name, &version, is_dev).await;
+
+                // Update shared cache
+                {
+                    let mut cache = resolved_cache.lock().await;
+                    cache.extend(temp_resolver.resolved_cache);
+                }
+
+                (name, result)
+            };
+
+            futures.push(future);
+        }
+
+        // Collect results
+        let mut resolved = Vec::new();
+        let mut failed_packages = Vec::new();
+
+        while let Some((package_name, result)) = futures.next().await {
+            match result {
                 Ok(resolved_pkg) => {
-                    print!(
-                        "\r  {} Resolved {} ({}){}",
-                        style("✓").green(),
-                        style(&name).white(),
-                        style(&resolved_pkg.version).dim(),
-                        " ".repeat(50)
+                    println!(
+                        "  {} Resolved {} ({})",
+                        CliStyle::success(""),
+                        style(&package_name).white(),
+                        style(&resolved_pkg.version).dim()
                     );
-                    print!("\n");
-                    io::stdout().flush().unwrap();
                     resolved.push(resolved_pkg);
                 }
                 Err(e) => {
-                    print!("\r{}", " ".repeat(80));
-                    print!(
-                        "\r{} Failed to resolve {}: {}\n",
-                        style("✗").red().bold(),
-                        style(&name).white().bold(),
+                    println!(
+                        "  {} Failed to resolve {}: {}",
+                        CliStyle::error(""),
+                        style(&package_name).white().bold(),
                         style(e.to_string()).dim()
                     );
-                    io::stdout().flush().unwrap();
-                    continue;
+                    failed_packages.push((package_name, e));
                 }
             }
         }
 
+        // Restore cache
+        {
+            let cache = resolved_cache.lock().await;
+            self.resolved_cache = cache.clone();
+        }
+
         // Show resolution summary
         if !resolved.is_empty() {
+            let success_msg = if !failed_packages.is_empty() {
+                format!(
+                    "Resolved {} packages successfully ({} failed)",
+                    resolved.len(),
+                    failed_packages.len()
+                )
+            } else {
+                format!("Resolved {} packages successfully", resolved.len())
+            };
+            parallel_spinner.finish_with_message(success_msg);
+        } else {
+            parallel_spinner.finish_with_message("No packages resolved");
+        }
+
+        if !failed_packages.is_empty() {
             println!(
-                "{} Resolved {} packages successfully",
-                style("📦").green(),
-                style(resolved.len().to_string()).green().bold()
+                "{} {} packages failed to resolve",
+                CliStyle::warning(""),
+                failed_packages.len()
             );
         }
 
@@ -374,14 +435,15 @@ impl ProgressTracker {
         let pb = ProgressBar::new(total);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.cyan} {bar:40.green/dim} {pos:>3}/{len:3} ┃ {elapsed_precise} ┃ {msg}",
-                )
+                .template("{spinner:.cyan} {bar:40.green/dim} {pos:>3}/{len:3} │ {elapsed_precise} │ {msg}")
                 .unwrap()
-                .progress_chars("━━╾─ "),
+                .progress_chars("█▉▊▋▌▍▎▏  ")
+                .tick_strings(&[
+                    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
+                ])
         );
-        pb.set_message("Initializing");
-        pb.enable_steady_tick(std::time::Duration::from_millis(80));
+        pb.set_message("Initializing...");
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
         Self {
             progress_bar: pb,
@@ -402,7 +464,7 @@ impl ProgressTracker {
         let message = if duration.as_millis() < 1000 {
             format!(
                 "{} {} package{} installed in {}ms",
-                style("✓").green().bold(),
+                CliStyle::success(""),
                 self.total,
                 if self.total == 1 { "" } else { "s" },
                 duration.as_millis()
@@ -410,7 +472,7 @@ impl ProgressTracker {
         } else {
             format!(
                 "{} {} package{} installed in {:.1}s",
-                style("✓").green().bold(),
+                CliStyle::success(""),
                 self.total,
                 if self.total == 1 { "" } else { "s" },
                 duration.as_millis() as f64 / 1000.0
@@ -421,7 +483,7 @@ impl ProgressTracker {
 }
 
 pub struct PackageManager {
-    npm_client: NpmClient,
+    pub npm_client: NpmClient,
     node_modules_dir: PathBuf,
     package_json_path: PathBuf,
     lock_file_path: PathBuf,
@@ -429,6 +491,7 @@ pub struct PackageManager {
     file_mutex: Arc<Mutex<()>>,
     cache_dir: PathBuf,
     use_toml_lock: bool,
+    content_store: Arc<ContentStore>,
 }
 
 impl PackageManager {
@@ -445,6 +508,8 @@ impl PackageManager {
             PathBuf::from("clay-lock.json")
         };
 
+        let content_store = Arc::new(ContentStore::new());
+
         Self {
             npm_client: NpmClient::new(),
             node_modules_dir: PathBuf::from("node_modules"),
@@ -454,6 +519,7 @@ impl PackageManager {
             file_mutex: Arc::new(Mutex::new(())),
             cache_dir,
             use_toml_lock: use_toml,
+            content_store,
         }
     }
 
@@ -537,9 +603,15 @@ impl PackageManager {
         // If all packages are already installed, skip resolution entirely
         if packages_to_check.is_empty() {
             if is_specific_install {
-                println!("{} All packages are already installed", style("✓").green());
+                println!(
+                    "{}",
+                    CliStyle::success("All packages are already installed")
+                );
             } else {
-                println!("{} All packages are already installed", style("✓").green());
+                println!(
+                    "{}",
+                    CliStyle::success("All packages are already installed")
+                );
                 self.show_installed_packages_summary().await?;
             }
             return Ok(());
@@ -552,8 +624,9 @@ impl PackageManager {
             .collect();
 
         // Phase 1: Resolution
-        println!("{} Resolving dependencies...", style("🔍").blue());
+        let resolution_spinner = CliStyle::create_spinner("Resolving dependencies...");
         let resolved_packages = resolver.resolve_multiple_packages(package_specs).await?;
+        resolution_spinner.finish_with_message(CliStyle::success("Dependencies resolved"));
 
         if resolved_packages.is_empty() {
             println!("{} No valid packages to install", style("•").yellow());
@@ -589,13 +662,13 @@ impl PackageManager {
         if to_install.is_empty() {
             if is_specific_install {
                 println!(
-                    "{} All packages and dependencies are already installed",
-                    style("✓").green()
+                    "{}",
+                    CliStyle::success("All packages and dependencies are already installed")
                 );
             } else {
                 println!(
-                    "{} All packages and dependencies are already installed",
-                    style("✓").green()
+                    "{}",
+                    CliStyle::success("All packages and dependencies are already installed")
                 );
                 self.show_installed_packages_summary().await?;
             }
@@ -606,8 +679,7 @@ impl PackageManager {
         let total_packages = PackageResolver::count_total_packages(
             &to_install
                 .iter()
-                .map(|&pkg| pkg)
-                .cloned()
+                .map(|&pkg| pkg.clone())
                 .collect::<Vec<_>>(),
         );
 
@@ -615,7 +687,7 @@ impl PackageManager {
 
         println!(
             "{} Installing {} packages (including {} dependencies) [{}]...",
-            style("📦").green(),
+            CliStyle::info(""),
             to_install.len(),
             total_packages - to_install.len() as u64,
             style(lock_format).dim()
@@ -635,13 +707,13 @@ impl PackageManager {
         if to_install.len() == 1 {
             println!(
                 "\n{} Successfully installed {}",
-                style("✓").green().bold(),
+                CliStyle::success(""),
                 style(&to_install[0].name).white().bold()
             );
         } else {
             println!(
                 "\n{} Successfully installed {} packages",
-                style("✓").green().bold(),
+                CliStyle::success(""),
                 style(to_install.len()).white().bold()
             );
         }
@@ -691,7 +763,7 @@ impl PackageManager {
 
             if let Some(package_info) = package_info {
                 if let Some(ref dependencies) = package_info.dependencies {
-                    for (dep_name, _) in dependencies {
+                    for dep_name in dependencies.keys() {
                         let dep_package_dir = self.node_modules_dir.join(dep_name);
                         if !dep_package_dir.exists() {
                             count += 1;
@@ -774,7 +846,7 @@ impl PackageManager {
         }
 
         // Extract the tarball to node_modules
-        progress.update(&format!("{} {}", style("⚡").yellow(), package_info.name));
+        progress.update(&format!("{} {}", CliStyle::arrow(""), package_info.name));
         self.extract_package(&tarball_path, &package_dir).await?;
 
         // Setup bin commands for this package
@@ -814,7 +886,7 @@ impl PackageManager {
         .await?;
 
         // Update progress for main package
-        progress.update(&format!("{} {}", style("✓").green(), package_info.name));
+        progress.update(&format!("{} {}", CliStyle::success(""), package_info.name));
 
         // Install dependencies in parallel if any
         if let Some(ref dependencies) = package_info.dependencies {
@@ -1009,7 +1081,7 @@ impl PackageManager {
         for task in tasks {
             match task.await? {
                 Ok((dep_name, deps)) => {
-                    progress.update(&format!("{} {}", style("✓").green(), dep_name));
+                    progress.update(&format!("{} {}", CliStyle::success(""), dep_name));
                     if let Some(deps) = deps {
                         nested_dependencies.push((dep_name, deps));
                     }
@@ -1075,7 +1147,7 @@ impl PackageManager {
         if let Some(dependencies) = &package_json.dependencies {
             if !dependencies.is_empty() {
                 has_deps = true;
-                for (dep_name, _) in dependencies {
+                for dep_name in dependencies.keys() {
                     let dep_package_dir = self.node_modules_dir.join(dep_name);
                     if !dep_package_dir.exists() {
                         total_packages += 1;
@@ -1088,7 +1160,7 @@ impl PackageManager {
         if let Some(dev_dependencies) = &package_json.dev_dependencies {
             if !dev_dependencies.is_empty() {
                 has_deps = true;
-                for (dep_name, _) in dev_dependencies {
+                for dep_name in dev_dependencies.keys() {
                     let dep_package_dir = self.node_modules_dir.join(dep_name);
                     if !dep_package_dir.exists() {
                         total_packages += 1;
@@ -1103,7 +1175,10 @@ impl PackageManager {
         }
 
         if total_packages == 0 {
-            println!("{} All dependencies already installed", style("✓").green());
+            println!(
+                "{}",
+                CliStyle::success("All dependencies already installed")
+            );
             return Ok(());
         }
 
@@ -1127,7 +1202,7 @@ impl PackageManager {
         // Show summary
         println!(
             "\n{} Installed {} dependencies",
-            style("✓").green().bold(),
+            CliStyle::success(""),
             style(total_packages).white().bold()
         );
 
@@ -1153,7 +1228,7 @@ impl PackageManager {
         if !can_remove {
             println!(
                 "{} Cannot remove {} - required by: {}",
-                style("✗").red().bold(),
+                CliStyle::error(""),
                 style(package_name).white().bold(),
                 style(dependents.join(", ")).dim()
             );
@@ -1164,7 +1239,7 @@ impl PackageManager {
         let mut progress = ProgressTracker::new(1);
         progress
             .progress_bar
-            .set_message(format!("{} {}", style("✗").red(), package_name));
+            .set_message(format!("{} {}", CliStyle::error(""), package_name));
 
         // Cleanup bin commands before removing package
         self.cleanup_bin_commands(package_name).await?;
@@ -1203,13 +1278,17 @@ impl PackageManager {
         }
 
         // Update progress
-        progress.update(&format!("{} Removed {}", style("✓").green(), package_name));
+        progress.update(&format!(
+            "{} Removed {}",
+            CliStyle::success(""),
+            package_name
+        ));
         progress.finish();
 
         // Show summary
         println!(
             "\n{} Uninstalled {}",
-            style("✓").green().bold(),
+            CliStyle::success(""),
             style(package_name).white().bold()
         );
 
@@ -1446,7 +1525,7 @@ impl PackageManager {
 
         // Show user-installed packages
         if !user_packages.is_empty() {
-            println!("{} User-installed packages:", style("📦").blue().bold());
+            println!("{}", CliStyle::section_header("User-installed packages:"));
             for package in &user_packages {
                 let version = self
                     .get_package_version(package)
@@ -1456,7 +1535,7 @@ impl PackageManager {
                     "  {} {} {}",
                     style("•").cyan(),
                     style(package).white().bold(),
-                    style(&format!("v{}", version)).dim()
+                    style(&format!("v{version}")).dim()
                 );
             }
             println!();
@@ -1469,7 +1548,7 @@ impl PackageManager {
             .collect();
 
         if !dependencies.is_empty() {
-            println!("{} Dependencies:", style("🔗").dim().bold());
+            println!("{}", CliStyle::dim_text("Dependencies:"));
             for package in &dependencies {
                 let version = self
                     .get_package_version(package)
@@ -1479,7 +1558,7 @@ impl PackageManager {
                     "  {} {} {}",
                     style("•").dim(),
                     style(package).dim(),
-                    style(&format!("v{}", version)).dim()
+                    style(&format!("v{version}")).dim()
                 );
             }
             println!();
@@ -1487,7 +1566,7 @@ impl PackageManager {
 
         println!(
             "{} {} user packages, {} dependencies ({} total)",
-            style("✓").green().bold(),
+            CliStyle::success(""),
             style(user_packages.len()).white().bold(),
             style(dependencies.len()).dim(),
             style(all_packages.len()).white()
@@ -1508,7 +1587,7 @@ impl PackageManager {
             return Ok(());
         }
 
-        println!("\n{} Installed packages:", style("📋").blue());
+        println!("\n{}", CliStyle::section_header("Installed packages:"));
 
         // Show packages in a more compact format
         let mut current_line = String::new();
@@ -1518,25 +1597,25 @@ impl PackageManager {
                 .await
                 .unwrap_or_else(|| "unknown".to_string());
 
-            let package_str = format!("{}@{}", package, version);
+            let package_str = format!("{package}@{version}");
 
             if current_line.is_empty() {
-                current_line = format!("  {}", package_str);
+                current_line = format!("  {package_str}");
             } else if current_line.len() + package_str.len() + 2 < 80 {
-                current_line.push_str(&format!(", {}", package_str));
+                current_line.push_str(&format!(", {package_str}"));
             } else {
-                println!("{}", current_line);
-                current_line = format!("  {}", package_str);
+                println!("{current_line}");
+                current_line = format!("  {package_str}");
             }
         }
 
         if !current_line.is_empty() {
-            println!("{}", current_line);
+            println!("{current_line}");
         }
 
         println!(
             "\n{} {} packages total",
-            style("✓").green().bold(),
+            CliStyle::success(""),
             style(user_packages.len()).white().bold()
         );
 
@@ -1597,7 +1676,7 @@ impl PackageManager {
         Ok((already_installed, to_install))
     }
 
-    async fn get_installed_packages(&self) -> Result<Vec<String>> {
+    pub async fn get_installed_packages(&self) -> Result<Vec<String>> {
         let mut packages = Vec::new();
 
         let mut entries = fs::read_dir(&self.node_modules_dir).await?;
@@ -1673,7 +1752,7 @@ impl PackageManager {
             while let Some(entry) = entries.next_entry().await? {
                 if let Ok(metadata) = entry.metadata().await {
                     if metadata.is_file()
-                        && entry.path().extension().map_or(false, |ext| ext == "tgz")
+                        && entry.path().extension().is_some_and(|ext| ext == "tgz")
                     {
                         total_size += metadata.len();
                         package_count += 1;
@@ -1682,7 +1761,7 @@ impl PackageManager {
             }
         }
 
-        println!("{} Cache Information", style("📦").cyan());
+        println!("{}", CliStyle::section_header("Cache Information"));
         println!("Cache directory: {}", style(self.cache_dir.display()).dim());
         println!(
             "Cached packages: {}",
@@ -1705,7 +1784,7 @@ impl PackageManager {
             let mut cleared_count = 0u32;
 
             while let Some(entry) = entries.next_entry().await? {
-                if entry.path().extension().map_or(false, |ext| ext == "tgz") {
+                if entry.path().extension().is_some_and(|ext| ext == "tgz") {
                     fs::remove_file(entry.path()).await?;
                     cleared_count += 1;
                 }
@@ -1713,7 +1792,7 @@ impl PackageManager {
 
             println!(
                 "{} Cleared {} cached packages",
-                style("✓").green(),
+                CliStyle::success(""),
                 style(cleared_count.to_string()).green()
             );
         } else {
@@ -1871,7 +1950,7 @@ impl PackageManager {
                             } else {
                                 println!(
                                     "{} Added bin command: {}",
-                                    style("🔧").blue(),
+                                    CliStyle::info(""),
                                     style(command_name).white()
                                 );
                             }
@@ -1954,7 +2033,7 @@ impl PackageManager {
                                 fs::remove_file(&link_path).await.ok();
                                 println!(
                                     "{} Removed bin command: {}",
-                                    style("🔧").dim(),
+                                    CliStyle::dim_text(""),
                                     style(package_name).dim()
                                 );
                             }
@@ -1973,7 +2052,7 @@ impl PackageManager {
                                     fs::remove_file(&link_path).await.ok();
                                     println!(
                                         "{} Removed bin command: {}",
-                                        style("🔧").dim(),
+                                        CliStyle::dim_text(""),
                                         style(command_name).dim()
                                     );
                                 }
@@ -1999,7 +2078,7 @@ impl PackageManager {
     pub async fn run_script(&self, script_name: &str) -> Result<()> {
         // Check if package.json exists
         if !self.package_json_path.exists() {
-            println!("{} No package.json found", style("✗").red());
+            println!("{}", CliStyle::error("No package.json found"));
             return Ok(());
         }
 
@@ -2011,7 +2090,7 @@ impl PackageManager {
         let scripts = match package_json.get("scripts") {
             Some(Value::Object(scripts)) => scripts,
             _ => {
-                println!("{} No scripts found in package.json", style("✗").red());
+                println!("{}", CliStyle::error("No scripts found in package.json"));
                 return Ok(());
             }
         };
@@ -2022,7 +2101,7 @@ impl PackageManager {
             _ => {
                 println!(
                     "{} Script '{}' not found",
-                    style("✗").red(),
+                    CliStyle::error(""),
                     style(script_name).white()
                 );
 
@@ -2046,9 +2125,9 @@ impl PackageManager {
 
         println!(
             "{} Running script: {} {}",
-            style("🚀").blue(),
+            CliStyle::info(""),
             style(script_name).white().bold(),
-            style(&format!("({})", script_command)).dim()
+            style(&format!("({script_command})")).dim()
         );
 
         // Check if node_modules/.bin exists and list contents for debugging
@@ -2061,7 +2140,7 @@ impl PackageManager {
             );
             println!(
                 "{} Installing packages may be required to create bin commands",
-                style("💡").blue()
+                CliStyle::info("")
             );
         } else {
             // List available bin commands for debugging
@@ -2077,7 +2156,7 @@ impl PackageManager {
                 if !bin_commands.is_empty() {
                     println!(
                         "{} Available bin commands: {}",
-                        style("🔧").dim(),
+                        CliStyle::dim_text(""),
                         bin_commands.join(", ")
                     );
                 }
@@ -2117,7 +2196,7 @@ impl PackageManager {
             cmd.env("PATH", new_path);
             println!(
                 "{} Added {} to PATH",
-                style("🔧").dim(),
+                CliStyle::dim_text(""),
                 bin_dir.to_string_lossy()
             );
         }
@@ -2126,19 +2205,19 @@ impl PackageManager {
         cmd.current_dir(self.package_json_path.parent().unwrap_or(Path::new(".")));
 
         // Execute the command
-        println!("{} Executing command...", style("⚡").cyan());
+        println!("{}", CliStyle::info("Executing command..."));
         let status = cmd.status()?;
 
         if status.success() {
             println!(
                 "\n{} Script '{}' completed successfully",
-                style("✓").green().bold(),
+                CliStyle::success(""),
                 style(script_name).white()
             );
         } else {
             println!(
                 "\n{} Script '{}' failed with exit code: {}",
-                style("✗").red().bold(),
+                CliStyle::error(""),
                 style(script_name).white(),
                 status.code().unwrap_or(-1)
             );
@@ -2151,7 +2230,7 @@ impl PackageManager {
     pub async fn list_scripts(&self) -> Result<()> {
         // Check if package.json exists
         if !self.package_json_path.exists() {
-            println!("{} No package.json found", style("✗").red());
+            println!("{}", CliStyle::error("No package.json found"));
             return Ok(());
         }
 
@@ -2192,13 +2271,217 @@ impl PackageManager {
 
         println!(
             "\n{} Run a script with: {} {}",
-            style("💡").yellow(),
+            CliStyle::warning(""),
             style("clay run").cyan(),
             style("<script-name>").dim()
         );
 
         Ok(())
     }
+
+    /// Automatically install peer dependencies
+    pub async fn auto_install_peer_dependencies(&self, package_info: &PackageInfo) -> Result<()> {
+        if let Some(ref peer_deps) = package_info.peer_dependencies {
+            if peer_deps.is_empty() {
+                return Ok(());
+            }
+
+            println!(
+                "{} Found {} peer dependencies for {}",
+                CliStyle::info(""),
+                style(peer_deps.len()).yellow(),
+                style(&package_info.name).white().bold()
+            );
+
+            let mut missing_peers = Vec::new();
+            let mut optional_peers = Vec::new();
+
+            // Check which peer dependencies are missing
+            for (peer_name, peer_version) in peer_deps {
+                let peer_package_dir = self.node_modules_dir.join(peer_name);
+
+                if !peer_package_dir.exists() {
+                    // Check if it's in optionalDependencies (less critical)
+                    if package_info
+                        .optional_dependencies
+                        .as_ref()
+                        .map(|opt_deps| opt_deps.contains_key(peer_name))
+                        .unwrap_or(false)
+                    {
+                        optional_peers.push((peer_name.clone(), peer_version.clone()));
+                    } else {
+                        missing_peers.push((peer_name.clone(), peer_version.clone()));
+                    }
+                }
+            }
+
+            // Install missing peer dependencies
+            if !missing_peers.is_empty() {
+                println!(
+                    "{} Installing {} required peer dependencies...",
+                    CliStyle::cyan_text(""),
+                    style(missing_peers.len()).yellow()
+                );
+
+                self.install_multiple_packages(missing_peers, false, false)
+                    .await?;
+            }
+
+            // Optionally install optional peer dependencies
+            if !optional_peers.is_empty() {
+                println!(
+                    "{} {} optional peer dependencies available:",
+                    CliStyle::info(""),
+                    optional_peers.len()
+                );
+
+                for (peer_name, peer_version) in &optional_peers {
+                    println!(
+                        "  {} {} {}",
+                        style("•").dim(),
+                        style(peer_name).white(),
+                        style(&format!("({peer_version})")).dim()
+                    );
+                }
+
+                // For now, auto-install optional peers too for better compatibility
+                println!(
+                    "{} Installing optional peer dependencies...",
+                    CliStyle::cyan_text("")
+                );
+                self.install_multiple_packages(optional_peers, false, false)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check for peer dependency conflicts
+    pub async fn check_peer_dependency_conflicts(&self) -> Result<Vec<PeerConflict>> {
+        let mut conflicts = Vec::new();
+        let installed_packages = self.get_installed_packages().await?;
+
+        for package_name in &installed_packages {
+            let package_json_path = self
+                .node_modules_dir
+                .join(package_name)
+                .join("package.json");
+
+            if let Ok(content) = fs::read_to_string(&package_json_path).await {
+                if let Ok(package_json) = serde_json::from_str::<PackageJson>(&content) {
+                    if let Some(ref peer_deps) = package_json.peer_dependencies {
+                        for (peer_name, peer_version_spec) in peer_deps {
+                            let peer_package_dir = self.node_modules_dir.join(peer_name);
+
+                            if peer_package_dir.exists() {
+                                // Check version compatibility
+                                let installed_version = self
+                                    .get_package_version(peer_name)
+                                    .await
+                                    .unwrap_or_else(|| "unknown".to_string());
+
+                                if !self
+                                    .is_version_compatible(&installed_version, peer_version_spec)
+                                {
+                                    conflicts.push(PeerConflict {
+                                        package: package_name.clone(),
+                                        peer_dependency: peer_name.clone(),
+                                        required_version: peer_version_spec.clone(),
+                                        installed_version: installed_version.clone(),
+                                    });
+                                }
+                            } else {
+                                conflicts.push(PeerConflict {
+                                    package: package_name.clone(),
+                                    peer_dependency: peer_name.clone(),
+                                    required_version: peer_version_spec.clone(),
+                                    installed_version: "missing".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(conflicts)
+    }
+
+    fn is_version_compatible(&self, installed: &str, required: &str) -> bool {
+        // Basic version compatibility check
+        // In a real implementation, you'd use semver crate for proper semver parsing
+        if let Some(required_version) = required.strip_prefix('^') {
+            // Caret range - compatible within same major version
+            return installed.starts_with(required_version.split('.').next().unwrap_or(""));
+        } else if let Some(required_version) = required.strip_prefix('~') {
+            // Tilde range - compatible within same major.minor version
+            let required_parts: Vec<&str> = required_version.split('.').collect();
+            let installed_parts: Vec<&str> = installed.split('.').collect();
+
+            if required_parts.len() >= 2 && installed_parts.len() >= 2 {
+                return required_parts[0] == installed_parts[0]
+                    && required_parts[1] == installed_parts[1];
+            }
+        } else if required == "*" {
+            return true;
+        } else {
+            // Exact version match
+            return installed == required;
+        }
+
+        false
+    }
+
+    /// Report peer dependency conflicts
+    pub async fn report_peer_conflicts(&self) -> Result<()> {
+        let conflicts = self.check_peer_dependency_conflicts().await?;
+
+        if conflicts.is_empty() {
+            println!(
+                "{}",
+                CliStyle::success("No peer dependency conflicts found")
+            );
+            return Ok(());
+        }
+
+        println!(
+            "{} Found {} peer dependency conflicts:",
+            style("⚠").yellow().bold(),
+            style(conflicts.len()).yellow()
+        );
+
+        for conflict in &conflicts {
+            println!(
+                "  {} {} requires {} {}, but {} is installed",
+                style("•").red(),
+                style(&conflict.package).white().bold(),
+                style(&conflict.peer_dependency).white(),
+                style(&conflict.required_version).cyan(),
+                if conflict.installed_version == "missing" {
+                    style("nothing").red().to_string()
+                } else {
+                    style(&conflict.installed_version).red().to_string()
+                }
+            );
+        }
+
+        println!(
+            "\n{} Run {} to auto-fix peer dependency issues",
+            CliStyle::info(""),
+            style("clay install --fix-peers").cyan()
+        );
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct PeerConflict {
+    pub package: String,
+    pub peer_dependency: String,
+    pub required_version: String,
+    pub installed_version: String,
 }
 
 impl Default for PackageManager {

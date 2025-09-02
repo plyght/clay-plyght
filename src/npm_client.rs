@@ -134,7 +134,7 @@ impl NpmClient {
         let mut hasher = Sha1::new();
         hasher.update(file_data);
         let computed_hash = hasher.finalize();
-        let computed_hash_hex = format!("{:x}", computed_hash);
+        let computed_hash_hex = format!("{computed_hash:x}");
 
         // Compare with expected hash
         let matches = computed_hash_hex == expected_shasum;
