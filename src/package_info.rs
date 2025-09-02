@@ -49,17 +49,23 @@ impl NpmRegistryResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PackageJson {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub main: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bin: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dependencies: Option<HashMap<String, String>>,
-    #[serde(rename = "devDependencies")]
+    #[serde(rename = "devDependencies", skip_serializing_if = "Option::is_none")]
     pub dev_dependencies: Option<HashMap<String, String>>,
-    #[serde(rename = "peerDependencies")]
+    #[serde(rename = "peerDependencies", skip_serializing_if = "Option::is_none")]
     pub peer_dependencies: Option<HashMap<String, String>>,
-    #[serde(rename = "optionalDependencies")]
+    #[serde(rename = "optionalDependencies", skip_serializing_if = "Option::is_none")]
     pub optional_dependencies: Option<HashMap<String, String>>,
 }
 
@@ -71,30 +77,36 @@ impl PackageJson {
             description: None,
             main: Some("index.js".to_string()),
             bin: None,
-            dependencies: Some(HashMap::new()),
-            dev_dependencies: Some(HashMap::new()),
-            peer_dependencies: Some(HashMap::new()),
-            optional_dependencies: Some(HashMap::new()),
+            dependencies: None,
+            dev_dependencies: None,
+            peer_dependencies: None,
+            optional_dependencies: None,
         }
     }
 
     pub fn add_dependency(&mut self, name: &str, version: &str) {
-        if let Some(ref mut deps) = self.dependencies {
-            deps.insert(name.to_string(), version.to_string());
-        } else {
-            let mut deps = HashMap::new();
-            deps.insert(name.to_string(), version.to_string());
-            self.dependencies = Some(deps);
+        match &mut self.dependencies {
+            Some(deps) => {
+                deps.insert(name.to_string(), version.to_string());
+            }
+            None => {
+                let mut deps = HashMap::new();
+                deps.insert(name.to_string(), version.to_string());
+                self.dependencies = Some(deps);
+            }
         }
     }
 
     pub fn add_dev_dependency(&mut self, name: &str, version: &str) {
-        if let Some(ref mut deps) = self.dev_dependencies {
-            deps.insert(name.to_string(), version.to_string());
-        } else {
-            let mut deps = HashMap::new();
-            deps.insert(name.to_string(), version.to_string());
-            self.dev_dependencies = Some(deps);
+        match &mut self.dev_dependencies {
+            Some(deps) => {
+                deps.insert(name.to_string(), version.to_string());
+            }
+            None => {
+                let mut deps = HashMap::new();
+                deps.insert(name.to_string(), version.to_string());
+                self.dev_dependencies = Some(deps);
+            }
         }
     }
 

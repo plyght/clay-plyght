@@ -71,12 +71,7 @@ impl ContentStore {
 
         // Check if content already exists
         if let Some(existing) = self.index.get(&content_hash) {
-            println!(
-                "{} Package {} already exists in content store ({})",
-                CliStyle::cyan_text(""),
-                style(package_name).white(),
-                style(&existing.hash[..8]).dim()
-            );
+            // Silent - package already in content store
             return Ok(existing.clone());
         }
 
@@ -109,12 +104,7 @@ impl ContentStore {
         // Persist index
         self.save_index().await?;
 
-        println!(
-            "{} Stored {} in content store ({})",
-            style("💾").green(),
-            style(package_name).white(),
-            style(&content_hash[..8]).dim()
-        );
+        // Silent storage - no output needed for clean final summary
 
         Ok(content_address)
     }
@@ -140,12 +130,7 @@ impl ContentStore {
                 self.extract_package_from_store(&content_path, target_path)
                     .await?;
 
-                println!(
-                    "{} Linked {} from content store ({})",
-                    CliStyle::info(""),
-                    style(package_name).white(),
-                    style(&metadata.content_address.hash[..8]).dim()
-                );
+                // Silent linking - clean final output
 
                 return Ok(true);
             }
@@ -181,11 +166,8 @@ impl ContentStore {
         let tree_json = serde_json::to_string_pretty(&tree)?;
         fs::write(&tree_path, tree_json).await?;
 
-        println!(
-            "{} Stored dependency tree ({})",
-            CliStyle::success(""),
-            style(&tree_hash[..8]).dim()
-        );
+        // Silent storage - only log during development if needed
+        // println!("Stored dependency tree ({})", &tree_hash[..8]);
 
         Ok(tree_hash)
     }
@@ -494,17 +476,63 @@ impl ContentStore {
         // Read compressed data
         let compressed_data = fs::read(store_path).await?;
 
-        // Decompress
-        use flate2::read::GzDecoder;
-        let mut decoder = GzDecoder::new(&compressed_data[..]);
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)?;
+        // Extract to parent directory first, then move package/ contents
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        
+        let temp_dir = target_path.with_extension("temp");
+        fs::create_dir_all(&temp_dir).await?;
+        
+        // Use blocking task for decompression and tar extraction
+        let temp_dir_clone = temp_dir.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            // Decompress
+            use flate2::read::GzDecoder;
+            let mut decoder = GzDecoder::new(&compressed_data[..]);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)?;
 
-        // Extract tarball
-        let mut archive = Archive::new(&decompressed[..]);
-        archive.set_overwrite(true);
-        archive.unpack(target_path)?;
+            // Extract tarball - use same reliable method as regular installs
+            let mut archive = Archive::new(&decompressed[..]);
+            archive.set_overwrite(true);
+            archive.unpack(&temp_dir_clone)?;
+            
+            Ok(())
+        }).await??;
+        
+        // Move from package/ to target directory (npm tarballs have package/ prefix)
+        let package_dir = temp_dir.join("package");
+        if package_dir.exists() {
+            // Move contents of package/ to target_path
+            fs::rename(&package_dir, target_path).await?;
+        } else {
+            // No package/ prefix, move entire temp dir contents
+            fs::rename(&temp_dir, target_path).await?;
+        }
+        
+        // Clean up temp directory
+        fs::remove_dir_all(&temp_dir).await.ok();
 
+        Ok(())
+    }
+
+    // Helper function for recursive directory copying
+    fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dest)?;
+        
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let src_path = entry.path();
+            let dest_path = dest.join(entry.file_name());
+            
+            if src_path.is_dir() {
+                Self::copy_dir_recursive(&src_path, &dest_path)?;
+            } else {
+                std::fs::copy(&src_path, &dest_path)?;
+            }
+        }
+        
         Ok(())
     }
 
