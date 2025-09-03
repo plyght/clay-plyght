@@ -4,6 +4,7 @@ use reqwest::Client;
 use sha1::{Digest, Sha1};
 use std::io::{self, Write};
 use std::path::Path;
+use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -17,8 +18,20 @@ pub struct NpmClient {
 
 impl NpmClient {
     pub fn new() -> Self {
+        let client = Client::builder()
+            .pool_max_idle_per_host(50)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(60))
+            .http2_prior_knowledge()
+            .http2_adaptive_window(true)
+            .http2_max_frame_size(Some(32 * 1024))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
         Self {
-            client: Client::new(),
+            client,
             registry_url: "https://registry.npmjs.org".to_string(),
         }
     }

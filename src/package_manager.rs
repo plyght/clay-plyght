@@ -317,7 +317,7 @@ impl PackageResolver {
         // Don't create separate spinners when using external spinner
 
         // Create semaphore for concurrency control
-        let semaphore = Arc::new(Semaphore::new(12)); // Allow up to 12 concurrent resolutions
+        let semaphore = Arc::new(Semaphore::new(50)); // Allow up to 50 concurrent resolutions
         let npm_client = self.npm_client.clone();
         let resolved_cache = Arc::new(Mutex::new(std::mem::take(&mut self.resolved_cache)));
 
@@ -510,7 +510,7 @@ impl PackageManager {
             node_modules_dir: PathBuf::from("node_modules"),
             package_json_path: PathBuf::from("package.json"),
             lock_file_path,
-            semaphore: Arc::new(Semaphore::new(8)), // Limit concurrent downloads
+            semaphore: Arc::new(Semaphore::new(30)), // Limit concurrent downloads
             file_mutex: Arc::new(Mutex::new(())),
             cache_dir,
             use_toml_lock: use_toml,
